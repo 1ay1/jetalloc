@@ -55,8 +55,12 @@ static jet_page* raw_page(void) {
     return pg;
 }
 
-/* Format a raw region into a slab of `cls`-sized blocks, building the initial
- * free list. Blocks live immediately after the header, aligned to JET_MIN_ALIGN. */
+/* Format a raw region into a slab for `cls`-sized blocks. We do NOT thread a
+ * free list through all blocks here — that would dirty every cache line in the
+ * 64 KiB page up front. Instead we set a BUMP cursor over the data region:
+ * the first `capacity` allocations are pure pointer arithmetic (bump += bs),
+ * touching memory only as it's actually handed out. Recycled blocks later
+ * flow through alloc_free/local_free/thread_free. */
 static void format_page(jet_page* pg, jet_heap* h, int cls) {
     uint32_t bs = jet_class_size[cls];
 
@@ -66,24 +70,13 @@ static void format_page(jet_page* pg, jet_heap* h, int cls) {
     uintptr_t top  = base + JET_PAGE_SIZE;
     uint32_t cap   = (uint32_t)((top - data) / bs);
 
-    /* Thread the free list through the blocks: each block's first word points
-     * at the next. Build it forward so the first pop returns the lowest
-     * address (nicer prefetch behaviour). */
-    void* head = NULL;
-    void** link = &head;
-    uintptr_t b = data;
-    for (uint32_t i = 0; i < cap; ++i) {
-        *link = (void*)b;
-        link = (void**)b;
-        b += bs;
-    }
-    *link = NULL;
-
-    pg->next        = NULL;
-    pg->prev        = NULL;
-    pg->alloc_free  = head;
+    pg->alloc_free  = NULL;                 /* no recycled blocks yet          */
+    pg->bump        = (uint8_t*)data;       /* hand out fresh blocks from here */
+    pg->bump_end    = (uint8_t*)(data + (size_t)cap * bs);
     pg->local_free  = NULL;
     atomic_store_explicit(&pg->thread_free, NULL, memory_order_relaxed);
+    pg->next        = NULL;
+    pg->prev        = NULL;
     pg->owner       = h;
     pg->block_size  = bs;
     pg->capacity    = cap;

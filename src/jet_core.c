@@ -71,14 +71,13 @@ static inline void* splice(void* head, void* other) {
     return other;
 }
 
-/* Ensure page->alloc_free is non-empty if the page still has free blocks.
- * Returns 1 if blocks are available afterwards. */
+/* Move any recycled blocks (owner local_free + cross-thread thread_free) into
+ * alloc_free so the fast pop path can serve them. Returns 1 if alloc_free is
+ * non-empty afterwards. Does NOT touch the bump cursor — the caller bumps. */
 static int refill_page(jet_page* pg) {
     if (pg->alloc_free) return 1;
-    /* Reclaim owner-thread deferred frees. */
     void* reclaimed = pg->local_free;
     pg->local_free = NULL;
-    /* Reclaim cross-thread frees. */
     void* remote = drain_thread_free(pg);
     pg->alloc_free = splice(reclaimed, remote);
     return pg->alloc_free != NULL;
@@ -112,7 +111,9 @@ static inline void partial_push(jet_heap* h, jet_page* pg) {
 /* Find or create a page with a free block for class `cls`, install it as the
  * active page, and return it. NULL on OOM. */
 static jet_page* obtain_page(jet_heap* h, int cls) {
-    /* Try partial pages first — refill each until one yields a block. */
+    /* Try partial pages first. A PARTIAL page only ever holds recycled blocks
+     * (its bump region was consumed before it was demoted), so refill_page is
+     * the right test. Promote the first one that yields a block. */
     jet_page* pg = h->partial[cls];
     while (pg) {
         jet_page* nxt = pg->next;
@@ -124,7 +125,7 @@ static jet_page* obtain_page(jet_heap* h, int cls) {
         }
         pg = nxt;
     }
-    /* Mint a fresh page. */
+    /* Mint a fresh page — it starts with a full bump region (page_has_room). */
     pg = jet_central_fresh_page(h, cls);
     if (!pg) return NULL;
     pg->flags = JET_PG_ACTIVE;
@@ -134,42 +135,44 @@ static jet_page* obtain_page(jet_heap* h, int cls) {
 
 /* ── malloc ───────────────────────────────────────────────────────────── */
 
+/* Pop one block from a page that is known to have capacity (alloc_free
+ * non-empty OR bump < bump_end). Pure fast path — no list scans. */
+static JET_ALWAYS_INLINE void* page_pop(jet_page* pg) {
+    void* b = pg->alloc_free;
+    if (JET_LIKELY(b != NULL)) {
+        pg->alloc_free = *(void**)b;   /* recycled block: hot, already resident */
+        pg->used++;
+        return b;
+    }
+    /* Bump: hand out a never-yet-touched block by pure arithmetic. */
+    uint8_t* p = pg->bump;
+    pg->bump = p + pg->block_size;
+    pg->used++;
+    return p;
+}
+
+/* Does this page have ANY servable block right now (recycled or bumpable)? */
+static JET_ALWAYS_INLINE int page_has_room(jet_page* pg) {
+    return pg->alloc_free != NULL || pg->bump < pg->bump_end;
+}
+
 static void* alloc_small(jet_heap* h, int cls) {
     jet_page* pg = h->active[cls];
-    if (JET_LIKELY(pg != NULL)) {
-        void* b = pg->alloc_free;
-        if (JET_LIKELY(b != NULL)) {
-#ifdef JET_DEBUG
-            if ((uintptr_t)b < (uintptr_t)pg + sizeof(jet_page) ||
-                (uintptr_t)b >= (uintptr_t)pg + JET_PAGE_SIZE ||
-                pg->used >= pg->capacity) {
-                fprintf(stderr, "jetalloc BUG: bad block %p page %p used=%u cap=%u\n",
-                        b, (void*)pg, pg->used, pg->capacity);
-                abort();
-            }
-#endif
-            pg->alloc_free = *(void**)b;
-            pg->used++;
-            return b;
-        }
-        /* Active page's fast list empty — try to refill in place. */
-        if (refill_page(pg)) {
-            void* b2 = pg->alloc_free;
-            pg->alloc_free = *(void**)b2;
-            pg->used++;
-            return b2;
-        }
-        /* Page is full: mark it FULL and drop from active. A later free will
-         * move it back to partial. */
+    if (JET_LIKELY(pg != NULL && page_has_room(pg)))
+        return page_pop(pg);
+
+    if (pg != NULL) {
+        /* Active page exhausted its recycled list AND its bump region. Try to
+         * reclaim deferred/cross-thread frees in place before giving up on it. */
+        if (refill_page(pg))
+            return page_pop(pg);
+        /* Genuinely full: mark FULL, drop from active. */
         pg->flags = JET_PG_FULL;
         h->active[cls] = NULL;
     }
     pg = obtain_page(h, cls);
     if (JET_UNLIKELY(!pg)) return NULL;
-    void* b = pg->alloc_free;
-    pg->alloc_free = *(void**)b;
-    pg->used++;
-    return b;
+    return page_pop(pg);
 }
 
 void* jet_malloc(size_t size) {

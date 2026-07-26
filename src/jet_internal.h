@@ -63,15 +63,19 @@ int jet_size_class(size_t size);
  * same-thread case.
  */
 typedef struct jet_page {
-    struct jet_page*  next;          /* intrusive: partial/full page lists    */
-    struct jet_page*  prev;
-    void*             alloc_free;     /* fast-path pop list                    */
-    void*             local_free;     /* owner-thread deferred frees           */
-    _Atomic(void*)    thread_free;    /* cross-thread frees (MPSC, tagged)     */
-    struct jet_heap*  owner;          /* heap that owns this page              */
+    /* ---- hot: touched on the alloc fast path (keep in the first cache line) */
+    void*             alloc_free;     /* recycled-block pop list (hot)         */
+    uint8_t*          bump;           /* bump cursor: never-yet-used region    */
+    uint8_t*          bump_end;       /* one past the last bumpable block      */
     uint32_t          block_size;     /* bytes per block (a class size)        */
-    uint32_t          capacity;       /* total blocks in the page              */
     uint32_t          used;           /* blocks currently allocated            */
+    /* ---- warm: free bookkeeping + list membership                          */
+    void*             local_free;     /* owner-thread deferred frees           */
+    _Atomic(void*)    thread_free;    /* cross-thread frees (MPSC Treiber)     */
+    struct jet_page*  next;           /* intrusive: partial/full page lists    */
+    struct jet_page*  prev;
+    struct jet_heap*  owner;          /* heap that owns this page              */
+    uint32_t          capacity;       /* total blocks in the page              */
     uint16_t          cls;            /* size-class index                      */
     uint16_t          flags;          /* JET_PG_* state (see jet_core.c)       */
 } jet_page;
