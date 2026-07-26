@@ -30,6 +30,7 @@ set(JET_CORE_SOURCES
     src/jet_large.c
     src/jet_percpu.c
     src/jet_epoch.c
+    src/jet_numa.c
     src/jet_rseq.S
     src/jet_core.c)
 

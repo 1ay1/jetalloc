@@ -216,11 +216,25 @@ every alloc → the remote-freeing thread's CAS invalidates the owner's line
 (false sharing). Splitting `thread_free` onto its own line is a direct threaded
 win.
 
-### 11. NUMA-local arenas + first-touch
-Bind each per-CPU (or per-socket) arena's pages to the local NUMA node
-(`mbind`/`set_mempolicy`, or just first-touch on the owning core so the default
-first-touch policy places them local). Cross-socket DRAM is ~2× latency; a
-server allocator that hands out remote-node memory silently halves bandwidth.
+### 11. NUMA-local arenas + first-touch ✅ (self-disabling; multi-socket only)
+**Source:** tcmalloc/jemalloc NUMA-aware arenas. **SHIPPED** (`src/jet_numa.c`).
+Every freshly-mapped span is bound to prefer the NUMA node of the CPU that
+asked for it (`mbind(2)` with `MPOL_PREFERRED`, via raw syscall — no libnuma
+dependency), so first-touch places its physical pages in the allocating
+thread's local DRAM. Cross-socket DRAM is ~2× latency and less bandwidth, so a
+server allocator that hands out remote-node memory silently halves throughput.
+
+**Self-disabling and honest:** node count is detected once at library-load
+(constructor, scanning `/sys/devices/system/node/nodeN`); on a **single-node**
+machine — including this dev box (`available: 1 nodes`) — the whole layer
+collapses to one predicted-not-taken branch and **never issues a syscall**, so
+there is provably **zero** effect on the benchmarks here (verified unchanged).
+It is armed only when nodes > 1. Best-effort (`MPOL_PREFERRED`, not `BIND`): a
+full local node falls back silently rather than failing the allocation, and any
+`mbind` error is ignored — placement is an optimisation, never correctness. The
+mechanism is unit-probed (getcpu + mbind both succeed on this host); the *win*
+is only demonstrable on multi-socket hardware. `JET_NUMA=0` forces it off.
+TSan + ASan/UBSan clean.
 
 ---
 

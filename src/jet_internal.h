@@ -227,6 +227,14 @@ void* jet_os_map(size_t bytes);            /* JET_PAGE_SIZE-aligned reserve   */
 void* jet_os_map_aligned(size_t bytes, size_t align);
 void  jet_os_unmap(void* p, size_t bytes);
 
+/* ── NUMA / topology-aware placement (jet_numa.c) ─────────────────────────
+ * Bind freshly-mapped spans to the local NUMA node so a thread's allocations
+ * live in its local DRAM. Entirely self-disabling on single-node machines (a
+ * predicted branch, no syscall) and best-effort (MPOL_PREFERRED) elsewhere. */
+void jet_numa_init(void);                  /* detect topology once             */
+int  jet_numa_active(void);                /* 1 iff binding is armed (>1 node) */
+void jet_numa_bind_local(void* addr, size_t len);  /* prefer caller's node     */
+
 /* ── Global stat counters (relaxed atomics) ───────────────────────────── */
 
 extern _Atomic(size_t) jet_stat_mapped;

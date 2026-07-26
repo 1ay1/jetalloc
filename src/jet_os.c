@@ -77,6 +77,11 @@ void* jet_os_map_aligned(size_t bytes, size_t align) {
         madvise((void*)aligned, bytes, MADV_HUGEPAGE);
 #endif
 
+    /* NUMA: prefer the local node for this span so first-touch places its
+     * physical pages in the allocating thread's local DRAM. No-op (one branch,
+     * no syscall) on single-node machines. */
+    jet_numa_bind_local((void*)aligned, bytes);
+
     atomic_fetch_add_explicit(&jet_stat_mapped, bytes, memory_order_relaxed);
     return (void*)aligned;
 #endif
