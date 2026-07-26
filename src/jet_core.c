@@ -68,6 +68,9 @@ static jet_heap* heap_create(void) {
     /* Arm the per-CPU (rseq) fast path once for the process. */
     pthread_once(&jet_percpu_once, jet_percpu_bootstrap);
 #endif
+    /* Enrol this thread in the epoch (QSBR) reclamation scheme so its
+     * quiescent states are visible to page reclaimers. */
+    jet_epoch_register(h);
     return h;
 }
 
@@ -215,6 +218,10 @@ static void* alloc_small(jet_heap* h, int cls) {
  * TLS overhead across a whole batch (transfer-cache idea, tcmalloc). Returns
  * NULL only on OOM. */
 static void* tcache_refill(jet_heap* h, int cls) {
+    /* Alloc slow path: a natural quiescent point — we hold no foreign page
+     * pointer here. Announce it so the epoch can advance and any limbo pages
+     * that are now provably unreachable get reclaimed into the central pool. */
+    jet_epoch_quiesce();
     /* Reclaim any cross-thread frees other threads posted to our inbox first,
      * so their memory re-enters our pages before we consider minting more. */
     if (JET_UNLIKELY(atomic_load_explicit(&h->remote_in, memory_order_relaxed)))
@@ -286,9 +293,15 @@ static void free_to_page(jet_page* pg, void* ptr) {
             return;
         }
         if (JET_UNLIKELY(pg->used == 0)) {
-            /* Page fully empty and not active — return it to the central pool. */
+            /* Page fully empty and not active. Do NOT hand it straight back to
+             * the central pool: a slow cross-thread freer may still hold this
+             * pointer and be about to CAS onto pg->thread_free. Defer the real
+             * free to the epoch reclaimer, which only repurposes the page once
+             * every thread has passed a quiescent state (no stale pointer can
+             * survive). Unlink from our partial list first — that's purely
+             * owner-local state, safe to touch now. */
             if (pg->flags == JET_PG_PARTIAL) partial_unlink(h, pg);
-            jet_central_retire_page(pg);
+            jet_epoch_retire(pg);
             return;
         }
         if (pg->flags == JET_PG_FULL) {
@@ -421,7 +434,9 @@ void jet_free(void* ptr) {
     jet_heap* h = jet_thread_heap();
     if (JET_LIKELY(pg->owner == h)) {
         /* Owner-thread free: push onto the per-class fast bin. No page-header
-         * bookkeeping, no flag machine — just two stores. */
+         * bookkeeping, no flag machine — just two stores. No epoch pin: our
+         * own page can't be retired-and-repurposed while WE are freeing into
+         * it (only the owner retires, and that's us). */
         unsigned cls = pg->cls;
         *(void**)ptr = h->tcache[cls];
         h->tcache[cls] = ptr;
@@ -429,10 +444,25 @@ void jet_free(void* ptr) {
             tcache_flush(h, cls);
         return;
     }
-    /* Cross-thread free: buffer it into the outgoing remote cache for its
-     * owner heap. No atomics here — the batch is flushed to the owner's inbox
-     * with a single CAS later (snmalloc message passing). */
-    remote_enqueue(h, pg->owner, ptr);
+    /* Cross-thread free. THIS is the hazardous path: the page could be retired
+     * and repurposed by its owner while we route the block. Pin the epoch so
+     * any concurrent retire is deferred until we leave, then re-read the owner
+     * under the pin. If the page was repurposed to us in the meantime, treat it
+     * as an owner free; otherwise enqueue to the (now pinned-stable) owner. The
+     * pin cost lands only on cross-thread frees, never the owner fast path. */
+    jet_epoch_enter();
+    jet_heap* owner = pg->owner;
+    if (JET_UNLIKELY(owner == h)) {
+        jet_epoch_leave();
+        unsigned cls = pg->cls;
+        *(void**)ptr = h->tcache[cls];
+        h->tcache[cls] = ptr;
+        if (JET_UNLIKELY(++h->tcount[cls] > JET_TCACHE_MAX))
+            tcache_flush(h, cls);
+        return;
+    }
+    remote_enqueue(h, owner, ptr);
+    jet_epoch_leave();
 }
 
 void jet_free_sized(void* ptr, size_t size) {

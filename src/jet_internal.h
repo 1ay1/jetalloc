@@ -176,6 +176,27 @@ int   jet_rseq_push(void* base, long stride, long cls_off, long rseq_off,
 jet_page* jet_central_fresh_page(jet_heap* h, int cls);  /* new formatted page */
 void      jet_central_retire_page(jet_page* pg);          /* fully-empty page   */
 
+/* ── Epoch-based (QSBR) safe page reclamation ─────────────────────────────
+ * A retired page must not be REPURPOSED (re-minted for a different class or
+ * unmapped) while another thread still holds a stale pointer to it and is about
+ * to CAS onto pg->thread_free. Such a thread is inside a "read-side critical
+ * section": between reading pg->owner and committing the cross-thread push.
+ *
+ * We solve this with quiescent-state-based reclamation (QSBR), the same class
+ * of algorithm as Linux RCU / the Crossbeam epoch crate: retire_page parks the
+ * page in a LIMBO list tagged with the current global epoch instead of freeing
+ * it immediately. A page is only truly freed once the global epoch has
+ * advanced far enough that every thread has passed through a quiescent state
+ * since the page was retired — at which point no thread can still hold the
+ * stale pointer. Threads announce quiescence with jet_epoch_quiesce() on their
+ * cold path; the cross-thread free path brackets its hazardous window with
+ * jet_epoch_enter()/jet_epoch_leave(). */
+void jet_epoch_register(jet_heap* h);     /* enrol a heap in the epoch scheme  */
+void jet_epoch_enter(void);               /* begin a read-side critical section */
+void jet_epoch_leave(void);               /* end it (announces a quiescent pt)  */
+void jet_epoch_retire(jet_page* pg);      /* defer page free until safe         */
+void jet_epoch_quiesce(void);             /* cold-path: try to advance + reclaim */
+
 /* ── Large (direct-mmap) allocations ──────────────────────────────────── */
 
 void*  jet_large_alloc(size_t size, size_t align);

@@ -116,6 +116,23 @@ buffered frees. Result: **producer/consumer 4.6× faster than glibc** (74 vs 16
 Mops/s) — the exact workload this technique targets. Tunable via
 `JET_REMOTE_FLUSH` (default 256).
 
+### 4b. Epoch-based (QSBR) safe page reclamation ✅ (correctness)
+**Source:** Linux RCU, the Crossbeam epoch crate, McKenney's QSBR. **SHIPPED**
+(`src/jet_epoch.c`). Fixes a genuine use-after-reformat race the batched
+cross-thread path had: a slow cross-thread free reads `pg->owner`, and in the
+window before it commits, the owner can empty the page, retire it, and
+`raw_page()` can re-mint that same 64 KiB region for a *different* size class —
+so the slow freer clobbers a live, repurposed page. QSBR closes it: a global
+epoch advances monotonically; the cross-thread free path *pins* the current
+epoch across its hazardous window (`jet_epoch_enter/leave`); `retire` parks the
+page in a limbo bag instead of freeing it; a page is only truly repurposed once
+the epoch has advanced twice with every thread observed quiescent — at which
+point no stale pointer can survive. The pin cost lands ONLY on cross-thread
+frees (a couple of stores + a fence), never on the owner fast path, so the
+benchmark is unchanged. **TSan-verified race-free** across 18M cross-thread
+frees; the same TSan pass also closed a pre-existing lazy size-map init race
+(now a library constructor).
+
 ### 5. Sized-class → index by one multiply-shift, no table
 **Source:** tcmalloc/mimalloc size-class math. jetalloc uses a 2 KiB lookup
 table. The faster trick used in production: for size `n`, the class is derived by
