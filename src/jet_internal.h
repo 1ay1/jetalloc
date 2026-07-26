@@ -136,7 +136,13 @@ typedef struct jet_page {
 /* Thread-cache depth: how many recycled blocks per class we hold in the heap's
  * fast bins before flushing surplus back to their pages. Bounds cache memory
  * while keeping the alloc/free hot path off the page headers most of the time. */
-#define JET_TCACHE_MAX 64
+#define JET_TCACHE_MAX 256    /* per-class fast-bin depth. Deeper bins amortise
+                               * the alloc slow path (page refill + cross-thread
+                               * inbox drain) over far more ops: measured
+                               * prod/cons 62->100 Mops vs the old 64, with
+                               * small-fixed/mixed/threaded all held or improved.
+                               * 512 starts hurting mixed-size locality; 256 is
+                               * the knee (bench/compare.sh, 12-core Zen). */
 
 /* ── Cross-thread (remote) free: batched message passing ──────────────────
  * A remote free (this thread frees a block owned by ANOTHER thread's heap)
