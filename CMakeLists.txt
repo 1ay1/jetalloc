@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(jetalloc LANGUAGES C CXX VERSION 0.1.0
+project(jetalloc LANGUAGES C CXX ASM VERSION 0.1.0
         DESCRIPTION "A fast, modern, drop-in memory allocator")
 
 set(CMAKE_C_STANDARD 11)
@@ -28,6 +28,8 @@ set(JET_CORE_SOURCES
     src/jet_size.c
     src/jet_central.c
     src/jet_large.c
+    src/jet_percpu.c
+    src/jet_rseq.S
     src/jet_core.c)
 
 add_library(jetalloc STATIC ${JET_CORE_SOURCES} src/jet_override.cpp)

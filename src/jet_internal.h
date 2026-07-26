@@ -138,6 +138,39 @@ typedef struct jet_heap {
 /* Access the calling thread's heap (creates on first touch). */
 jet_heap* jet_thread_heap(void);
 
+/* ── Per-CPU cache (rseq) ─────────────────────────────────────────────────
+ * A restartable-sequence per-CPU LIFO sits IN FRONT of the per-thread tcache.
+ * On Linux/x86-64 with rseq(2) (glibc auto-registers it), alloc/free hit the
+ * slab owned by whatever CPU the thread runs on — no atomics, no locks, and no
+ * per-thread cache-line ping-pong when many threads share few cores. This is
+ * tcmalloc's per-CPU cache mechanism. Falls back transparently to the tcache
+ * when rseq is unavailable (old kernel, non-x86-64, opt-out). */
+#define JET_PERCPU_MAX     128     /* blocks per (cpu,class) before overflow   */
+
+/* Fast inline guard read by the malloc/free hot path so that, when the per-CPU
+ * cache is disabled (the default), the only cost is a predicted-not-taken
+ * branch on a hot global — no function call at all. Written once at init. */
+extern int jet_percpu_on;
+
+/* Initialise the per-CPU subsystem once. Returns 1 if rseq is live and the
+ * per-CPU fast path is armed, 0 if we must fall back to the tcache. */
+int   jet_percpu_init(void);
+/* 1 if the per-CPU fast path is active for this process. */
+int   jet_percpu_active(void);
+/* Fast path: pop/push a block of class `cls` from the current CPU's slab.
+ * pop returns NULL when that slab is empty (caller falls back to tcache).
+ * push returns 1 on success, 0 when the slab is full (caller keeps the block
+ * in the tcache / returns it to its page). */
+void* jet_percpu_pop(int cls);
+int   jet_percpu_push(int cls, void* block);
+
+/* rseq asm primitives (jet_rseq.S). Present only on x86-64 Linux. */
+#if defined(__x86_64__) && defined(__linux__)
+void* jet_rseq_pop (void* base, long stride, long cls_off, long rseq_off);
+int   jet_rseq_push(void* base, long stride, long cls_off, long rseq_off,
+                    void* block);
+#endif
+
 /* ── Central span pool (locked, cold) ─────────────────────────────────── */
 
 jet_page* jet_central_fresh_page(jet_heap* h, int cls);  /* new formatted page */

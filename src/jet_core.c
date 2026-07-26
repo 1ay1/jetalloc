@@ -42,6 +42,11 @@ static void jet_thread_exit(void* arg) {
     if (h) remote_flush(h);
 }
 static void jet_tls_init(void) { pthread_key_create(&jet_tls_key, jet_thread_exit); }
+
+/* One-time per-CPU (rseq) subsystem init, guarded so it runs exactly once for
+ * the whole process regardless of which thread allocates first. */
+static pthread_once_t jet_percpu_once = PTHREAD_ONCE_INIT;
+static void jet_percpu_bootstrap(void) { (void)jet_percpu_init(); }
 #endif
 
 static jet_heap* heap_create(void) {
@@ -60,6 +65,8 @@ static jet_heap* heap_create(void) {
     /* Register for the thread-exit flush. */
     pthread_once(&jet_tls_once, jet_tls_init);
     pthread_setspecific(jet_tls_key, h);
+    /* Arm the per-CPU (rseq) fast path once for the process. */
+    pthread_once(&jet_percpu_once, jet_percpu_bootstrap);
 #endif
     return h;
 }
@@ -245,6 +252,12 @@ void* jet_malloc(size_t size) {
     JET_STAT_ADD(jet_stat_live, jet_class_size[cls]);
 
     jet_heap* h = jet_thread_heap();
+    /* Per-CPU (rseq) fast path (opt-in via JET_PERCPU): pop from the current
+     * CPU's slab with no atomics. Off by default — one predicted branch. */
+    if (JET_UNLIKELY(jet_percpu_on)) {
+        void* pc = jet_percpu_pop(cls);
+        if (pc != NULL) return pc;
+    }
     /* Fast bin hit: pop a recycled block without touching any page header. */
     void* b = h->tcache[cls];
     if (JET_LIKELY(b != NULL)) {
@@ -396,6 +409,14 @@ void jet_free(void* ptr) {
     }
     jet_page* pg = jet_page_of(ptr);
     JET_STAT_SUB(jet_stat_live, pg->block_size);
+
+    /* Per-CPU (rseq) fast path (opt-in via JET_PERCPU): return the block to the
+     * current CPU's slab. Works regardless of the page's original owner — the
+     * block is "checked out" until a later alloc pops it; page->used accounting
+     * only moves when a block finally drains to free_to_page. Off by default. */
+    if (JET_UNLIKELY(jet_percpu_on)) {
+        if (jet_percpu_push((int)pg->cls, ptr)) return;
+    }
 
     jet_heap* h = jet_thread_heap();
     if (JET_LIKELY(pg->owner == h)) {

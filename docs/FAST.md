@@ -48,10 +48,23 @@ itself.
 x86-64 + aarch64 only, Linux ≥ 4.18. Abort handler needs the 4-byte signature
 trick (an invalid opcode before the label) so a heap overflow can't redirect it.
 
-**jetalloc plan:** add `src/jet_rseq.S` with `jet_slab_pop`/`jet_slab_push`,
-register rseq per thread, keep the current thread-cache as the portable fallback
-when rseq is unavailable. This is the single biggest remaining win on the
-threaded benchmark (where we're at 0.90× glibc).
+**jetalloc status: SHIPPED (opt-in via `JET_PERCPU=1`).** `src/jet_rseq.S`
+implements `jet_rseq_pop`/`jet_rseq_push` as real restartable sequences (glibc
+auto-registers the per-thread `struct rseq`; we read `cpu_id_start` at `%fs:0`
+and commit with a single store; the abort label carries the 4-byte `RSEQ_SIG`).
+`src/jet_percpu.c` manages an `ncpu × NUM_CLASSES` slab table in front of the
+per-thread tcache, capped at `JET_PERCPU_MAX` blocks per (cpu,class).
+
+**Measured (12-core Zen kernel 7.1), honest:** on *this* machine the per-CPU
+cache does **not** beat the existing per-thread tcache + batched remote engine
+— on same-thread and cross-thread oversubscribed (64-thread) workloads alike it
+breaks even at best and regresses the single-thread fast path (the rseq CS entry
++ current-CPU read is pure overhead when the per-thread cache is already
+lock-free and uncontended). rseq per-CPU is a tcmalloc win primarily at **very
+high core counts** (64-128+), where per-thread cache *memory* becomes
+prohibitive and the central free-list lock contends. So it ships **off by
+default**, correct and ASan/UBSan-clean, available for big machines. When off,
+the cost is one predicted-not-taken branch on `jet_percpu_on`.
 
 ### 2. Per-CPU slab-pointer caching via `cpu_id_start` overlap  (crazy pointer hack)
 **Source:** same doc, "Current CPU Slabs Pointer Caching."
