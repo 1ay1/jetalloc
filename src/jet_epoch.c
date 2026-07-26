@@ -55,7 +55,7 @@ static _Thread_local jet_epoch_rec* tls_rec = NULL;
  * chained through pg->next. Guarded by a spinlock (cold path only). */
 typedef struct { _Atomic(int) v; } jet_spin2;
 static jet_spin2   limbo_lock = {0};
-static jet_page*   limbo[3]   = { NULL, NULL, NULL };
+static _Atomic(jet_page*) limbo[3] = { NULL, NULL, NULL };
 static uint64_t    limbo_epoch[3] = { 0, 0, 0 };   /* epoch each bag belongs to */
 
 static inline void l_lock(jet_spin2* s) {
@@ -161,17 +161,18 @@ void jet_epoch_retire(jet_page* pg) {
     l_lock(&limbo_lock);
     /* If this bag holds an OLDER epoch's pages that are now safe, flush them
      * first so the slot can be reused for the current epoch. */
-    if (limbo[slot] && limbo_epoch[slot] != g) {
+    jet_page* cur = atomic_load_explicit(&limbo[slot], memory_order_relaxed);
+    if (cur && limbo_epoch[slot] != g) {
         if (epoch_safe(limbo_epoch[slot], g)) {
-            jet_page* old = limbo[slot];
-            limbo[slot] = NULL;
+            atomic_store_explicit(&limbo[slot], NULL, memory_order_relaxed);
             l_unlock(&limbo_lock);
-            reclaim_chain(old);
+            reclaim_chain(cur);
             l_lock(&limbo_lock);
+            cur = NULL;
         }
     }
-    pg->next = limbo[slot];
-    limbo[slot] = pg;
+    pg->next = cur;
+    atomic_store_explicit(&limbo[slot], pg, memory_order_relaxed);
     limbo_epoch[slot] = g;
     l_unlock(&limbo_lock);
 }
@@ -185,14 +186,30 @@ void jet_epoch_quiesce(void) {
                                  memory_order_release);
     uint64_t g = epoch_try_advance();
 
+    /* FAST PATH: if every limbo bag is empty there is nothing to reclaim, and
+     * taking limbo_lock three times per alloc-slow-path just to confirm that
+     * is pure overhead — on a churny stream this is called hundreds of
+     * thousands of times with the bags almost always empty. An unlocked
+     * RELAXED read of each bag pointer is race-free now that limbo[] is
+     * atomic: seeing NULL means no page was in that bag at this instant, so
+     * there is nothing this call could have reclaimed anyway; a page retired
+     * concurrently is simply picked up by the next quiesce. */
+    if (JET_LIKELY(
+            atomic_load_explicit(&limbo[0], memory_order_relaxed) == NULL &&
+            atomic_load_explicit(&limbo[1], memory_order_relaxed) == NULL &&
+            atomic_load_explicit(&limbo[2], memory_order_relaxed) == NULL))
+        return;
+
     /* Drain every safe bag. Take the lock before touching limbo[] — no
-     * unlocked pre-check, or we'd race the retire path (TSan-verified). */
+     * unlocked pre-check inside the loop, or we'd race the retire path
+     * (TSan-verified); the empty-check above is the only unlocked read. */
     for (unsigned slot = 0; slot < 3; ++slot) {
         l_lock(&limbo_lock);
         jet_page* ready = NULL;
-        if (limbo[slot] && epoch_safe(limbo_epoch[slot], g)) {
-            ready = limbo[slot];
-            limbo[slot] = NULL;
+        jet_page* cur = atomic_load_explicit(&limbo[slot], memory_order_relaxed);
+        if (cur && epoch_safe(limbo_epoch[slot], g)) {
+            ready = cur;
+            atomic_store_explicit(&limbo[slot], NULL, memory_order_relaxed);
         }
         l_unlock(&limbo_lock);
         if (ready) reclaim_chain(ready);
