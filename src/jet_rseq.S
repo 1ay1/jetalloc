@@ -31,7 +31,14 @@
  *      returns 1 on success, 0 never (push always succeeds once it commits).
  */
 
-#if defined(__x86_64__) && defined(__linux__)
+/* Pull in __GLIBC__ so we can match jet_percpu.c's guard exactly. rseq needs
+ * glibc (which registers the per-thread struct rseq); on musl the C side is a
+ * no-op, so these functions would be dead symbols — skip them entirely to keep
+ * the object empty and the guards in lock-step. .S files don't auto-include
+ * <features.h>, so pull it explicitly (it's a no-op #include on musl too). */
+#include <features.h>
+
+#if defined(__x86_64__) && defined(__linux__) && defined(__GLIBC__)
 
 /* struct rseq layout (see linux/rseq.h): cpu_id_start @0, cpu_id @4,
  * rseq_cs @8 (8 bytes). RSEQ_SIG is the required pre-abort signature. */
@@ -139,4 +146,4 @@ __rseq_cs_push:
 /* Mark the stack as non-executable. */
 	.section	.note.GNU-stack, "", @progbits
 
-#endif /* __x86_64__ && __linux__ */
+#endif /* __x86_64__ && __linux__ && __GLIBC__ */

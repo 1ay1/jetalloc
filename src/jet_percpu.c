@@ -23,7 +23,14 @@
  */
 #include "jet_internal.h"
 
-#if defined(__x86_64__) && defined(__linux__)
+/* rseq needs glibc's <sys/rseq.h> (>= 2.35) which exposes __rseq_offset /
+ * __rseq_size and the kernel's registered area. musl does NOT ship this header
+ * (nor auto-register an rseq area), so restrict the whole layer to glibc. On
+ * musl / any other libc the layer compiles to a no-op and jet_core falls
+ * straight through to the tcache — see the file header on why correctness never
+ * depends on rseq. __GLIBC__ is defined via <features.h> (pulled by
+ * jet_internal.h's standard headers). */
+#if defined(__x86_64__) && defined(__linux__) && defined(__GLIBC__)
 #  define JET_HAVE_RSEQ 1
 #  include <sys/rseq.h>          /* __rseq_offset / __rseq_size (glibc >= 2.35) */
 #  include <unistd.h>
