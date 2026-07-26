@@ -233,12 +233,27 @@ typedef struct jet_remote_bucket {
     uint32_t         count;   /* blocks queued in this bucket                  */
 } jet_remote_bucket;
 
+/* A per-class fast bin. head and count are used TOGETHER by every single
+ * malloc and every single free, so they live in the SAME 16 bytes rather than
+ * in two parallel arrays 300+ bytes apart — where the hot path had to touch
+ * TWO separate cache lines (two L1 entries, two prefetch streams) per
+ * operation. Co-located, a tight malloc/free loop touches ONE line total.
+ *
+ * Padded to 16, not packed to 12: measured both. The 12-byte packing halves
+ * nothing that matters (the array is 468 vs 624 B, both far past a line) and
+ * costs unaligned head loads plus a multiply instead of a shift to index —
+ * it measured slower on EVERY workload. Power-of-two wins. */
+typedef struct jet_bin {
+    void*    head;    /* LIFO of recycled blocks, intrusively linked */
+    uint32_t count;   /* blocks currently parked here                */
+    uint32_t _pad;    /* -> 16 B: index by shift, naturally aligned  */
+} jet_bin;
+
 typedef struct jet_heap {
     /* Fast bins: per-class LIFO of recycled blocks. Alloc pops here first,
      * free pushes here first — both without touching a page header. Mirrors
      * glibc's tcache / mimalloc's thread free list. */
-    void*       tcache[JET_NUM_CLASSES];
-    uint32_t    tcount[JET_NUM_CLASSES];
+    jet_bin     bin[JET_NUM_CLASSES];
     /* One "current" page per size class for O(1) refill/flush. */
     jet_page*   active[JET_NUM_CLASSES];
     /* Partially-free pages per class, tried when `active` fills. */
@@ -423,16 +438,16 @@ static JET_ALWAYS_INLINE void* jet_malloc_inline(size_t size) {
 #endif
     jet_heap* h = jet_tls_heap;
     int cls = jet_size_class_fast(size);
-    void* b = h->tcache[cls];
+    void* b = h->bin[cls].head;
     if (JET_LIKELY(b != NULL)) {
-        h->tcache[cls] = *(void**)b;
+        h->bin[cls].head = *(void**)b;
         /* The decrement looks like it could be dropped (tcount is only READ on
          * the free path's over-cap test, and tcache_flush recounts). It cannot:
          * measured small-fixed 286 -> 221 Mops/s. Without it tcount climbs
          * monotonically, so once it passes JET_TCACHE_MAX every subsequent free
          * calls tcache_flush, and each call walks JET_TCACHE_MAX/2 list nodes to
          * find the split point. Don't remove it. */
-        h->tcount[cls]--;
+        h->bin[cls].count--;
         return b;
     }
     /* Empty bin — or this thread is still on the zero sentinel, whose bins are
@@ -457,9 +472,9 @@ static JET_ALWAYS_INLINE int jet_free_inline(void* ptr) {
      * on every single free. */
     if (JET_LIKELY(pg->owner == h)) {
         unsigned cls = pg->cls;
-        *(void**)ptr = h->tcache[cls];
-        h->tcache[cls] = ptr;
-        if (JET_UNLIKELY(++h->tcount[cls] > JET_TCACHE_MAX))
+        *(void**)ptr = h->bin[cls].head;
+        h->bin[cls].head = ptr;
+        if (JET_UNLIKELY(++h->bin[cls].count > JET_TCACHE_MAX))
             jet_tcache_flush_pub(h, cls);
         return 1;
     }

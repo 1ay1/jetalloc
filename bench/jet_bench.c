@@ -50,7 +50,10 @@ static void bench_small_fixed(void) {
 }
 
 static void bench_mixed_size(void) {
-    const long N = 10 * 1000 * 1000;
+    /* 10M ops completed in ~0.05 s, which is well inside timer/scheduler noise
+     * — run-to-run spread was larger than most optimisations being measured.
+     * 80M puts the run at ~0.4 s so the median of N actually means something. */
+    const long N = 80 * 1000 * 1000;
     const int  W = 1024;               /* live working set */
     void** live = calloc(W, sizeof(void*));
     unsigned seed = 12345;

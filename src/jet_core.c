@@ -321,7 +321,7 @@ static void tcache_batch_fill(jet_heap* h, int cls) {
     jet_page* pg = h->active[cls];
     if (JET_UNLIKELY(pg == NULL)) return;
     uint32_t want = JET_TCACHE_MAX / 2;
-    void* head = h->tcache[cls];
+    void* head = h->bin[cls].head;
     uint32_t got = 0;
     while (got < want && page_has_room(pg)) {
         void* b = page_pop(pg);
@@ -329,8 +329,8 @@ static void tcache_batch_fill(jet_heap* h, int cls) {
         head = b;
         ++got;
     }
-    h->tcache[cls] = head;
-    h->tcount[cls] += got;
+    h->bin[cls].head = head;
+    h->bin[cls].count += got;
 }
 
 static void* tcache_refill(jet_heap* h, int cls) {
@@ -391,10 +391,10 @@ void* jet_malloc(size_t size) {
     jet_heap* h = tls_heap;
     if (JET_LIKELY(h != &jet_null_heap)) {
         if (JET_LIKELY(!jet_percpu_on)) {
-            void* b = h->tcache[cls];
+            void* b = h->bin[cls].head;
             if (JET_LIKELY(b != NULL)) {
-                h->tcache[cls] = *(void**)b;
-                h->tcount[cls]--;
+                h->bin[cls].head = *(void**)b;
+                h->bin[cls].count--;
                 return b;
             }
             return tcache_refill(h, cls);
@@ -409,10 +409,10 @@ void* jet_malloc(size_t size) {
         if (pc != NULL) return pc;
     }
     /* Fast bin hit: pop a recycled block without touching any page header. */
-    void* b = h->tcache[cls];
+    void* b = h->bin[cls].head;
     if (JET_LIKELY(b != NULL)) {
-        h->tcache[cls] = *(void**)b;
-        h->tcount[cls]--;
+        h->bin[cls].head = *(void**)b;
+        h->bin[cls].count--;
         return b;
     }
     /* Bin empty: refill a batch from pages, amortizing the slow path. */
@@ -422,7 +422,7 @@ void* jet_malloc(size_t size) {
 /* ── free ─────────────────────────────────────────────────────────────── */
 
 static void free_to_page(jet_page* pg, void* ptr) {
-    jet_heap* h = jet_thread_heap();
+    jet_heap* h = pg->owner;
     /* INVARIANT: free_to_page is only ever called for pages this heap owns.
      * Its two callers — tcache_flush (surplus of the owner's own frees) and
      * remote_drain (blocks other threads returned to OUR inbox, i.e. our
@@ -465,15 +465,15 @@ static void free_to_page(jet_page* pg, void* ptr) {
  * memory is actually reclaimable. Blocks in a bin are all the same class but
  * may belong to different pages; free_to_page routes each correctly. */
 static void tcache_flush(jet_heap* h, unsigned cls) {
-    void* node = h->tcache[cls];
+    void* node = h->bin[cls].head;
     uint32_t keep = JET_TCACHE_MAX / 2;
     /* Walk to the split point, keeping the first `keep` nodes cached. */
     for (uint32_t i = 1; i < keep && node; ++i)
         node = *(void**)node;
-    if (!node) { h->tcount[cls] = h->tcount[cls] < keep ? h->tcount[cls] : keep; return; }
+    if (!node) { h->bin[cls].count = h->bin[cls].count < keep ? h->bin[cls].count : keep; return; }
     void* surplus = *(void**)node;
     *(void**)node = NULL;            /* terminate the kept list              */
-    h->tcount[cls] = keep;
+    h->bin[cls].count = keep;
     /* Return the surplus chain to pages. */
     while (surplus) {
         void* next = *(void**)surplus;
@@ -623,9 +623,9 @@ void jet_free(void* ptr) {
          * it (only the owner retires, and that's us). A bare TLS load (no call)
          * thanks to initial-exec; only the first free on a thread misses. */
         unsigned cls = pg->cls;
-        *(void**)ptr = h->tcache[cls];
-        h->tcache[cls] = ptr;
-        if (JET_UNLIKELY(++h->tcount[cls] > JET_TCACHE_MAX))
+        *(void**)ptr = h->bin[cls].head;
+        h->bin[cls].head = ptr;
+        if (JET_UNLIKELY(++h->bin[cls].count > JET_TCACHE_MAX))
             tcache_flush(h, cls);
         return;
     }
@@ -641,9 +641,9 @@ void jet_free(void* ptr) {
     if (JET_UNLIKELY(owner == h)) {
         jet_epoch_leave();
         unsigned cls = pg->cls;
-        *(void**)ptr = h->tcache[cls];
-        h->tcache[cls] = ptr;
-        if (JET_UNLIKELY(++h->tcount[cls] > JET_TCACHE_MAX))
+        *(void**)ptr = h->bin[cls].head;
+        h->bin[cls].head = ptr;
+        if (JET_UNLIKELY(++h->bin[cls].count > JET_TCACHE_MAX))
             tcache_flush(h, cls);
         return;
     }
@@ -728,10 +728,10 @@ void* jet_calloc(size_t count, size_t size) {
     jet_heap* h = tls_heap;
     if (JET_LIKELY(h != &jet_null_heap && !jet_percpu_on)) {
         /* tcache blocks are recycled → must zero. */
-        void* b = h->tcache[cls];
+        void* b = h->bin[cls].head;
         if (b != NULL) {
-            h->tcache[cls] = *(void**)b;
-            h->tcount[cls]--;
+            h->bin[cls].head = *(void**)b;
+            h->bin[cls].count--;
             memset(b, 0, jet_class_size[cls]);
             return b;
         }
