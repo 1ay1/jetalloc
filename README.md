@@ -16,11 +16,11 @@ Because a system allocator upgrade should never break your binary. jetalloc is
 self-contained (no external dependency, no fragile global `free()` interposition
 that crashes during C++ locale init), and it's *fast*:
 
-| Workload                | jetalloc      | glibc malloc | speedup |
-|-------------------------|---------------|--------------|---------|
-| small-fixed (32 B loop) | **329 Mops/s** | 223 Mops/s  | 1.48×   |
-| mixed-size (8 B–4 KiB)  | **49 Mops/s**  | 17 Mops/s   | 2.83×   |
-| threaded (8 threads)    | 845 Mops/s    | 1086 Mops/s | 0.78×   |
+| Workload                | jetalloc       | glibc malloc | speedup |
+|-------------------------|----------------|--------------|---------|
+| small-fixed (32 B loop) | **253 Mops/s** | 235 Mops/s   | 1.08×   |
+| mixed-size (8 B–4 KiB)  | **164 Mops/s** | 18 Mops/s    | 9.1×    |
+| threaded (8 threads)    | 1030 Mops/s    | 1149 Mops/s  | 0.90×   |
 
 *(GCC 16, x86-64, `bench/jet_bench.c` — run it yourself, numbers vary by CPU.)*
 
@@ -29,6 +29,13 @@ that crashes during C++ locale init), and it's *fast*:
 - **Thread-local heaps.** Each thread owns its pages. The alloc fast path is a
   single free-list pop; the free fast path is a single push. No atomics on the
   common same-thread path.
+- **Per-class thread cache (fast bins).** In front of the pages, each heap keeps
+  a small LIFO of recycled blocks per size class (like glibc's tcache /
+  mimalloc's thread free list). Most `malloc`/`free` pairs hit the bin and never
+  touch page bookkeeping at all; surplus is flushed back to pages in batches.
+- **Bump allocation.** A fresh page hands out its never-used blocks by pure
+  pointer arithmetic (`bump += size`) — no up-front freelist threading, so a new
+  page dirties only the cache lines it actually serves.
 - **64 KiB slab pages, header-free blocks.** A block's owning page is recovered
   by masking its address (`ptr & ~(64KiB-1)`), so blocks carry no bookkeeping
   bytes — denser cache lines than a classic sized-header malloc.

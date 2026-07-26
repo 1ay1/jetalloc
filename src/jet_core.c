@@ -181,7 +181,16 @@ void* jet_malloc(size_t size) {
         return jet_large_alloc(size, JET_MIN_ALIGN);
     int cls = jet_size_class(size);
     JET_STAT_ADD(jet_stat_live, jet_class_size[cls]);
-    return alloc_small(jet_thread_heap(), cls);
+
+    jet_heap* h = jet_thread_heap();
+    /* Fast bin hit: pop a recycled block without touching any page header. */
+    void* b = h->tcache[cls];
+    if (JET_LIKELY(b != NULL)) {
+        h->tcache[cls] = *(void**)b;
+        h->tcount[cls]--;
+        return b;
+    }
+    return alloc_small(h, cls);
 }
 
 /* ── free ─────────────────────────────────────────────────────────────── */
@@ -222,6 +231,30 @@ static void free_to_page(jet_page* pg, void* ptr) {
     }
 }
 
+/* Flush surplus fast-bin blocks for class `cls` back to their owning pages.
+ * Called when a bin exceeds JET_TCACHE_MAX. We keep the MRU half (still hot in
+ * cache, likely to be reallocated soon) and return the LRU half to pages via
+ * free_to_page — which does the used-- bookkeeping and retires empty pages, so
+ * memory is actually reclaimable. Blocks in a bin are all the same class but
+ * may belong to different pages; free_to_page routes each correctly. */
+static void tcache_flush(jet_heap* h, unsigned cls) {
+    void* node = h->tcache[cls];
+    uint32_t keep = JET_TCACHE_MAX / 2;
+    /* Walk to the split point, keeping the first `keep` nodes cached. */
+    for (uint32_t i = 1; i < keep && node; ++i)
+        node = *(void**)node;
+    if (!node) { h->tcount[cls] = h->tcount[cls] < keep ? h->tcount[cls] : keep; return; }
+    void* surplus = *(void**)node;
+    *(void**)node = NULL;            /* terminate the kept list              */
+    h->tcount[cls] = keep;
+    /* Return the surplus chain to pages. */
+    while (surplus) {
+        void* next = *(void**)surplus;
+        free_to_page(jet_page_of(surplus), surplus);
+        surplus = next;
+    }
+}
+
 void jet_free(void* ptr) {
     if (JET_UNLIKELY(ptr == NULL)) return;
     JET_STAT_ADD(jet_stat_free_calls, 1);
@@ -233,7 +266,26 @@ void jet_free(void* ptr) {
     }
     jet_page* pg = jet_page_of(ptr);
     JET_STAT_SUB(jet_stat_live, pg->block_size);
-    free_to_page(pg, ptr);
+
+    jet_heap* h = jet_thread_heap();
+    if (JET_LIKELY(pg->owner == h)) {
+        /* Owner-thread free: push onto the per-class fast bin. No page-header
+         * bookkeeping, no flag machine — just two stores. */
+        unsigned cls = pg->cls;
+        *(void**)ptr = h->tcache[cls];
+        h->tcache[cls] = ptr;
+        if (JET_UNLIKELY(++h->tcount[cls] > JET_TCACHE_MAX))
+            tcache_flush(h, cls);
+        return;
+    }
+    /* Cross-thread free: hand the block back to its owning page's lock-free
+     * remote-free stack (the owner drains it on its next refill). */
+    void* head = atomic_load_explicit(&pg->thread_free, memory_order_relaxed);
+    do {
+        *(void**)ptr = head;
+    } while (!atomic_compare_exchange_weak_explicit(
+        &pg->thread_free, &head, ptr, memory_order_release,
+        memory_order_relaxed));
 }
 
 void jet_free_sized(void* ptr, size_t size) {

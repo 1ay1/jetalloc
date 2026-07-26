@@ -86,8 +86,18 @@ typedef struct jet_page {
 
 /* ── Per-thread heap ──────────────────────────────────────────────────── */
 
+/* Thread-cache depth: how many recycled blocks per class we hold in the heap's
+ * fast bins before flushing surplus back to their pages. Bounds cache memory
+ * while keeping the alloc/free hot path off the page headers most of the time. */
+#define JET_TCACHE_MAX 64
+
 typedef struct jet_heap {
-    /* One "current" page per size class for O(1) allocation. */
+    /* Fast bins: per-class LIFO of recycled blocks. Alloc pops here first,
+     * free pushes here first — both without touching a page header. Mirrors
+     * glibc's tcache / mimalloc's thread free list. */
+    void*       tcache[JET_NUM_CLASSES];
+    uint32_t    tcount[JET_NUM_CLASSES];
+    /* One "current" page per size class for O(1) refill/flush. */
     jet_page*   active[JET_NUM_CLASSES];
     /* Partially-free pages per class, tried when `active` fills. */
     jet_page*   partial[JET_NUM_CLASSES];
