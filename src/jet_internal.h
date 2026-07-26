@@ -69,15 +69,18 @@ typedef struct jet_page {
     uint8_t*          bump_end;       /* one past the last bumpable block      */
     uint32_t          block_size;     /* bytes per block (a class size)        */
     uint32_t          used;           /* blocks currently allocated            */
-    /* ---- warm: free bookkeeping + list membership                          */
+    /* ---- warm: free bookkeeping + list membership (owner-only)              */
     void*             local_free;     /* owner-thread deferred frees           */
-    _Atomic(void*)    thread_free;    /* cross-thread frees (MPSC Treiber)     */
     struct jet_page*  next;           /* intrusive: partial/full page lists    */
     struct jet_page*  prev;
     struct jet_heap*  owner;          /* heap that owns this page              */
     uint32_t          capacity;       /* total blocks in the page              */
     uint16_t          cls;            /* size-class index                      */
     uint16_t          flags;          /* JET_PG_* state (see jet_core.c)       */
+    /* ---- cold, CONTENDED: written by *remote* threads via CAS. Kept on its
+     * own cache line so a cross-thread free's CAS does NOT invalidate the
+     * owner's hot line above (false-sharing fix — snmalloc RemoteAllocator). */
+    _Alignas(64) _Atomic(void*) thread_free;
 } jet_page;
 
 /* thread_free stores a (head_ptr | count) style tagged head is unnecessary;

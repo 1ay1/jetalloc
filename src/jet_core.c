@@ -175,6 +175,35 @@ static void* alloc_small(jet_heap* h, int cls) {
     return page_pop(pg);
 }
 
+/* Batch-refill: pull up to `want` blocks out of the heap's pages into the
+ * class fast bin, then return one. Amortizes the alloc_small / page-header /
+ * TLS overhead across a whole batch (transfer-cache idea, tcmalloc). Returns
+ * NULL only on OOM. */
+static void* tcache_refill(jet_heap* h, int cls) {
+    /* Grab the first block the normal way (also mints a page if needed). */
+    void* first = alloc_small(h, cls);
+    if (JET_UNLIKELY(!first)) return NULL;
+
+    /* Then greedily pull more from the now-active page straight into the bin,
+     * without re-entering alloc_small per block. Cap the batch so a single
+     * malloc can't front-load an unbounded amount of work. */
+    jet_page* pg = h->active[cls];
+    if (JET_LIKELY(pg != NULL)) {
+        uint32_t want = JET_TCACHE_MAX / 2;
+        void* head = h->tcache[cls];
+        uint32_t got = 0;
+        while (got < want && page_has_room(pg)) {
+            void* b = page_pop(pg);
+            *(void**)b = head;
+            head = b;
+            ++got;
+        }
+        h->tcache[cls] = head;
+        h->tcount[cls] += got;
+    }
+    return first;
+}
+
 void* jet_malloc(size_t size) {
     JET_STAT_ADD(jet_stat_alloc_calls, 1);
     if (JET_UNLIKELY(size > JET_LARGE_THRESHOLD))
@@ -190,7 +219,8 @@ void* jet_malloc(size_t size) {
         h->tcount[cls]--;
         return b;
     }
-    return alloc_small(h, cls);
+    /* Bin empty: refill a batch from pages, amortizing the slow path. */
+    return tcache_refill(h, cls);
 }
 
 /* ── free ─────────────────────────────────────────────────────────────── */
