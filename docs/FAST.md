@@ -149,6 +149,22 @@ Treiber stack entirely — shrinking the page header by a whole `_Alignas(64)`
 cache line (denser TLB/cache, higher usable-byte ratio) and simplifying the
 free path. Bitmap goal achieved by a strictly better mechanism.
 
+### 4d. Alloc-time local/shared classification ✅ (~1.15× prod/cons)
+**Source:** scalloc's private/shared spans; mimalloc's local/shared free
+distinction. **SHIPPED.** Each heap keeps a saturating one-byte `shared_score`
+per size class, bumped whenever that class takes a cross-thread free. A class
+that proves producer/consumer-heavy (score ≥ `JET_SHARED_HOT`) is reclassified
+"shared-hot" and its outgoing remote bucket is allowed to accumulate a much
+larger batch — bounded by a BYTE budget (`JET_SHARED_HOT_BYTES`, 512 KiB), so
+small classes batch thousands deep while 32 KiB classes still flush after a
+handful and stranded memory stays bounded (≤ 512 KiB × 16 buckets per thread).
+More blocks per atomic post = fewer CASes on the owner's inbox; a rarely-shared
+class keeps a small fixed cap so a one-off cross-thread free never strands.
+The score lives on the (already cold) cross-thread free path — the owner fast
+path never reads it. Measured: **prod/cons 65–70 → 75–80 Mops/s** with the other
+three benchmarks unchanged; larger byte budgets push it to ~90 at a memory
+cost, so 512 KiB is the shipped default. TSan + ASan/UBSan clean.
+
 ### 5. Sized-class → index by one multiply-shift, no table
 **Source:** tcmalloc/mimalloc size-class math. jetalloc uses a 2 KiB lookup
 table. The faster trick used in production: for size `n`, the class is derived by

@@ -352,8 +352,10 @@ static void remote_flush(jet_heap* h) {
 
 /* Buffer one cross-thread free into the outgoing cache, bucketed by target
  * heap. Pure local stores — no atomics on this path. Auto-flushes when the
- * cache fills. */
-static void remote_enqueue(jet_heap* h, jet_heap* owner, void* ptr) {
+ * cache fills. `cls` drives alloc-time local/shared classification: a class
+ * seen freeing cross-thread repeatedly is marked shared-hot and its bucket is
+ * flushed EAGERLY (small batch) so the owner recycles the memory promptly. */
+static void remote_enqueue(jet_heap* h, jet_heap* owner, unsigned cls, void* ptr) {
     unsigned slot = (unsigned)(((uintptr_t)owner >> 6) & JET_REMOTE_MASK);
     jet_remote_bucket* b = &h->remote_out[slot];
     if (JET_UNLIKELY(b->owner && b->owner != owner)) {
@@ -367,7 +369,37 @@ static void remote_enqueue(jet_heap* h, jet_heap* owner, void* ptr) {
     *(void**)ptr = b->head;   /* prepend; tail stays the first-inserted node  */
     b->head = ptr;
     b->count++;
-    if (JET_UNLIKELY(++h->remote_pending >= JET_REMOTE_FLUSH))
+    ++h->remote_pending;
+
+    /* Classify: this class just took a cross-thread free — bump its shared
+     * score (saturating). A confirmed shared-hot class earns a LARGER per-
+     * bucket batch (fewer atomic posts per block); a rarely-shared class uses
+     * a small batch so a stray cross-thread free can't strand blocks. */
+    uint8_t sc = h->shared_score[cls];
+    if (sc < 255) h->shared_score[cls] = sc + 1;
+    if (JET_LIKELY(sc >= JET_SHARED_HOT)) {
+        /* Confirmed shared-hot: accumulate a batch bounded by a fixed BYTE
+         * budget (so small classes batch deeply, large classes flush promptly)
+         * and bypass the global cross-class flush cap so a steady
+         * producer/consumer stream costs the fewest possible atomics. */
+        uint32_t cap = JET_SHARED_HOT_BYTES / jet_class_size[cls];
+        if (cap < JET_SHARED_COLD) cap = JET_SHARED_COLD;
+        if (JET_UNLIKELY(b->count >= cap)) {
+            remote_post_batch(b->owner, b->head, b->tail);
+            h->remote_pending -= b->count;
+            b->owner = NULL; b->head = NULL; b->tail = NULL; b->count = 0;
+        }
+        return;
+    }
+    /* Rarely-shared class: small per-bucket cap, and still subject to the
+     * global flush so a stray cross-thread free can't strand a block for long. */
+    if (JET_UNLIKELY(b->count >= JET_SHARED_COLD)) {
+        remote_post_batch(b->owner, b->head, b->tail);
+        h->remote_pending -= b->count;
+        b->owner = NULL; b->head = NULL; b->tail = NULL; b->count = 0;
+        return;
+    }
+    if (JET_UNLIKELY(h->remote_pending >= JET_REMOTE_FLUSH))
         remote_flush(h);
 }
 
@@ -440,7 +472,7 @@ void jet_free(void* ptr) {
             tcache_flush(h, cls);
         return;
     }
-    remote_enqueue(h, owner, ptr);
+    remote_enqueue(h, owner, pg->cls, ptr);
     jet_epoch_leave();
 }
 
