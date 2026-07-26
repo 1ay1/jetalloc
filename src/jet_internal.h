@@ -94,6 +94,25 @@ typedef struct jet_page {
  * while keeping the alloc/free hot path off the page headers most of the time. */
 #define JET_TCACHE_MAX 64
 
+/* ── Cross-thread (remote) free: batched message passing ──────────────────
+ * A remote free (this thread frees a block owned by ANOTHER thread's heap)
+ * does NOT touch the owner per object. Instead each thread accumulates remote
+ * frees in a local RemoteCache, bucketed by target heap, and periodically
+ * FLUSHES each bucket as ONE batch onto the owner's lock-free inbox with a
+ * single atomic. The owner drains its whole inbox in one atomic-exchange on
+ * its slow path. This is snmalloc's message-passing scheme: thousands of
+ * cross-thread frees cost one atomic per batch, not one CAS per object. */
+#define JET_REMOTE_SLOTS   16      /* outgoing buckets (power of two)          */
+#define JET_REMOTE_MASK    (JET_REMOTE_SLOTS - 1)
+#define JET_REMOTE_FLUSH   256     /* pending remote frees before auto-flush   */
+
+typedef struct jet_remote_bucket {
+    struct jet_heap* owner;   /* target heap for this bucket (NULL = empty)    */
+    void*            head;    /* intrusive chain of pending blocks             */
+    void*            tail;    /* tail, so a batch splices onto the inbox O(1)  */
+    uint32_t         count;   /* blocks queued in this bucket                  */
+} jet_remote_bucket;
+
 typedef struct jet_heap {
     /* Fast bins: per-class LIFO of recycled blocks. Alloc pops here first,
      * free pushes here first — both without touching a page header. Mirrors
@@ -104,8 +123,16 @@ typedef struct jet_heap {
     jet_page*   active[JET_NUM_CLASSES];
     /* Partially-free pages per class, tried when `active` fills. */
     jet_page*   partial[JET_NUM_CLASSES];
+    /* Outgoing remote-free cache: blocks this thread freed that belong to
+     * OTHER heaps, bucketed by target, flushed in batches. */
+    jet_remote_bucket remote_out[JET_REMOTE_SLOTS];
+    uint32_t          remote_pending;   /* total across all buckets           */
     struct jet_heap* next_heap;        /* global registry for teardown        */
     uint64_t    tid;                   /* owning thread id (debug)            */
+    /* Incoming inbox: batches of our blocks freed by OTHER threads land here
+     * via a single atomic push. On its own cache line — remote producers CAS
+     * this while we read our hot fields above. */
+    _Alignas(64) _Atomic(void*) remote_in;
 } jet_heap;
 
 /* Access the calling thread's heap (creates on first touch). */

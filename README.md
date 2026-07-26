@@ -18,9 +18,10 @@ that crashes during C++ locale init), and it's *fast*:
 
 | Workload                | jetalloc       | glibc malloc | speedup |
 |-------------------------|----------------|--------------|---------|
-| small-fixed (32 B loop) | **253 Mops/s** | 235 Mops/s   | 1.08×   |
-| mixed-size (8 B–4 KiB)  | **164 Mops/s** | 18 Mops/s    | 9.1×    |
-| threaded (8 threads)    | 1030 Mops/s    | 1149 Mops/s  | 0.90×   |
+| small-fixed (32 B loop) | **254 Mops/s** | 222 Mops/s   | 1.14×   |
+| mixed-size (8 B–4 KiB)  | **164 Mops/s** | 16 Mops/s    | 10×     |
+| threaded (same-thread)  | 975 Mops/s     | 1148 Mops/s  | 0.85×   |
+| **producer/consumer**   | **74 Mops/s**  | 16 Mops/s    | 4.6×    |
 
 *(GCC 16, x86-64, `bench/jet_bench.c` — run it yourself, numbers vary by CPU.)*
 
@@ -43,6 +44,15 @@ that crashes during C++ locale init), and it's *fast*:
   (owner-thread frees, no atomics) and an atomic `thread_free` (cross-thread
   frees, lock-free Treiber stack). The owner drains `thread_free` lazily, so
   neither hot path pays for the cross-thread case it isn't hitting.
+- **Batched cross-thread free (snmalloc message passing).** A free of another
+  thread's block is *not* pushed to the owner one-at-a-time. Each thread buffers
+  remote frees in a local cache bucketed by target heap, then flushes each
+  bucket as **one batch with a single atomic CAS** onto the owner's inbox. The
+  owner reclaims its whole inbox in one atomic-exchange. Thousands of
+  cross-thread frees cost one atomic *per batch*, not per object — this is why
+  jetalloc runs the producer/consumer workload **4.6× faster than glibc** (which
+  locks on every cross-thread free). A thread-exit destructor flushes any
+  buffered frees so nothing is ever stranded.
 - **39 size classes**, ≤ 12.5 % internal fragmentation, O(1) size→class map.
 - **Large allocations** (> 32 KiB) go straight to `mmap`, page-aligned, with a
   one-page header so `free` / `usable_size` / `owns` are O(1).

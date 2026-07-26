@@ -67,6 +67,10 @@ add_executable(jet_test_mt test/jet_test_mt.c)
 target_link_libraries(jet_test_mt PRIVATE jetalloc Threads::Threads)
 add_test(NAME jet_test_mt COMMAND jet_test_mt)
 
+add_executable(jet_test_xthread test/jet_test_xthread.c)
+target_link_libraries(jet_test_xthread PRIVATE jetalloc Threads::Threads)
+add_test(NAME jet_test_xthread COMMAND jet_test_xthread)
+
 # ── Benchmark ────────────────────────────────────────────────────────────
 add_executable(jet_bench bench/jet_bench.c)
 target_link_libraries(jet_bench PRIVATE jetalloc Threads::Threads)

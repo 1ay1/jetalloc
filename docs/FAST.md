@@ -93,17 +93,15 @@ pagemap**, so a slab page is 100% user bytes.
 
 ## Tier A — big, portable, no kernel magic
 
-### 4. Free-list *multi*-sharding (mimalloc's "big idea")
-**Source:** mimalloc readme + tech report. jetalloc already has the two-list
-version (`local_free` + atomic `thread_free`). mimalloc's full scheme has
-*three* per-page lists: `free` (alloc pops here), `local_free` (owner frees push
-here), and a `thread_free` atomic (remote frees, single CAS). The `free` list is
-only refilled from `local_free` at a "page collect" — this **separates the alloc
-cursor from the free cursor entirely**, so a free never touches the list the
-allocator is currently popping (no write-write cache ping-pong on one line). It
-also enables a *deferred* free that batches the collect. jetalloc's `alloc_free`
-vs `local_free` is exactly this; the missing bit is the periodic generic-collect
-heartbeat.
+### 4. Free-list *multi*-sharding (mimalloc's "big idea") + batched message passing ✅
+**Source:** mimalloc readme + tech report; snmalloc RemoteCache. **SHIPPED.**
+jetalloc now buffers cross-thread frees in a thread-local outgoing cache
+bucketed by target heap, and flushes each bucket as ONE batched CAS onto the
+owner's inbox (`remote_post_batch`), which the owner drains in a single
+atomic-exchange (`remote_drain`). A thread-exit destructor flushes residual
+buffered frees. Result: **producer/consumer 4.6× faster than glibc** (74 vs 16
+Mops/s) — the exact workload this technique targets. Tunable via
+`JET_REMOTE_FLUSH` (default 256).
 
 ### 5. Sized-class → index by one multiply-shift, no table
 **Source:** tcmalloc/mimalloc size-class math. jetalloc uses a 2 KiB lookup

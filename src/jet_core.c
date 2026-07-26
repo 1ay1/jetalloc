@@ -26,6 +26,24 @@ static _Thread_local jet_heap* tls_heap = NULL;
 /* All heaps chained for teardown/trim. Guarded by a spinlock (cold). */
 static _Atomic(jet_heap*) heap_registry = NULL;
 
+static void remote_flush(jet_heap* h);   /* fwd: flush outgoing remote cache  */
+
+#if !defined(_WIN32)
+#  include <pthread.h>
+/* A thread-exit destructor guarantees a dying thread posts any remote frees it
+ * still has buffered (so cross-thread-freed memory is never stranded when the
+ * freeing thread exits before hitting the flush threshold). The heap struct
+ * itself is intentionally NOT torn down here — its pages may still hold live
+ * blocks other threads will free later; it stays in the registry. */
+static pthread_key_t  jet_tls_key;
+static pthread_once_t jet_tls_once = PTHREAD_ONCE_INIT;
+static void jet_thread_exit(void* arg) {
+    jet_heap* h = (jet_heap*)arg;
+    if (h) remote_flush(h);
+}
+static void jet_tls_init(void) { pthread_key_create(&jet_tls_key, jet_thread_exit); }
+#endif
+
 static jet_heap* heap_create(void) {
     /* Bootstrap the heap struct itself from a dedicated large alloc so we do
      * not recurse through jet_malloc before a heap exists. */
@@ -38,6 +56,11 @@ static jet_heap* heap_create(void) {
         h->next_heap = head;
     } while (!atomic_compare_exchange_weak_explicit(
         &heap_registry, &head, h, memory_order_release, memory_order_relaxed));
+#if !defined(_WIN32)
+    /* Register for the thread-exit flush. */
+    pthread_once(&jet_tls_once, jet_tls_init);
+    pthread_setspecific(jet_tls_key, h);
+#endif
     return h;
 }
 
@@ -50,6 +73,11 @@ jet_heap* jet_thread_heap(void) {
 }
 
 /* ── Free-list plumbing ───────────────────────────────────────────────── */
+
+/* Forward declarations for the cross-thread message-passing machinery, which
+ * is defined below jet_free but referenced by the alloc slow path. */
+static int  remote_drain(jet_heap* h);
+static void free_to_page(jet_page* pg, void* ptr);
 
 /* Drain a page's atomic cross-thread free list into a plain pointer chain,
  * returning the head. Lock-free: single atomic exchange grabs the whole stack. */
@@ -180,6 +208,11 @@ static void* alloc_small(jet_heap* h, int cls) {
  * TLS overhead across a whole batch (transfer-cache idea, tcmalloc). Returns
  * NULL only on OOM. */
 static void* tcache_refill(jet_heap* h, int cls) {
+    /* Reclaim any cross-thread frees other threads posted to our inbox first,
+     * so their memory re-enters our pages before we consider minting more. */
+    if (JET_UNLIKELY(atomic_load_explicit(&h->remote_in, memory_order_relaxed)))
+        remote_drain(h);
+
     /* Grab the first block the normal way (also mints a page if needed). */
     void* first = alloc_small(h, cls);
     if (JET_UNLIKELY(!first)) return NULL;
@@ -285,6 +318,73 @@ static void tcache_flush(jet_heap* h, unsigned cls) {
     }
 }
 
+/* ── Cross-thread free: batched message passing (snmalloc-style) ───────── */
+
+/* Push a whole chain [first..last] (count nodes) onto owner's inbox with ONE
+ * atomic CAS. `last`'s link word is set to the previous inbox head so the
+ * owner sees a single connected stack. This is the only atomic paid per
+ * BATCH of remote frees — not per object. */
+static void remote_post_batch(jet_heap* owner, void* first, void* last) {
+    void* head = atomic_load_explicit(&owner->remote_in, memory_order_relaxed);
+    do {
+        *(void**)last = head;
+    } while (!atomic_compare_exchange_weak_explicit(
+        &owner->remote_in, &head, first, memory_order_release,
+        memory_order_relaxed));
+}
+
+/* Flush all buffered outgoing remote frees: one batched CAS per target heap. */
+static void remote_flush(jet_heap* h) {
+    for (unsigned i = 0; i < JET_REMOTE_SLOTS; ++i) {
+        jet_remote_bucket* b = &h->remote_out[i];
+        if (b->owner) {
+            remote_post_batch(b->owner, b->head, b->tail);
+            b->owner = NULL; b->head = NULL; b->tail = NULL; b->count = 0;
+        }
+    }
+    h->remote_pending = 0;
+}
+
+/* Buffer one cross-thread free into the outgoing cache, bucketed by target
+ * heap. Pure local stores — no atomics on this path. Auto-flushes when the
+ * cache fills. */
+static void remote_enqueue(jet_heap* h, jet_heap* owner, void* ptr) {
+    unsigned slot = (unsigned)(((uintptr_t)owner >> 6) & JET_REMOTE_MASK);
+    jet_remote_bucket* b = &h->remote_out[slot];
+    if (JET_UNLIKELY(b->owner && b->owner != owner)) {
+        /* Slot collision with a different target: flush this one bucket now so
+         * we never mix two owners' chains. */
+        remote_post_batch(b->owner, b->head, b->tail);
+        h->remote_pending -= b->count;
+        b->owner = NULL; b->head = NULL; b->tail = NULL; b->count = 0;
+    }
+    if (!b->owner) { b->owner = owner; b->tail = ptr; }
+    *(void**)ptr = b->head;   /* prepend; tail stays the first-inserted node  */
+    b->head = ptr;
+    b->count++;
+    if (JET_UNLIKELY(++h->remote_pending >= JET_REMOTE_FLUSH))
+        remote_flush(h);
+}
+
+/* Owner side: drain our inbox (one atomic-exchange grabs the whole stack) and
+ * fold every returned block back into our pages. Called on the alloc slow
+ * path so reclaimed cross-thread memory re-enters circulation. Returns the
+ * number of blocks reclaimed. */
+static int remote_drain(jet_heap* h) {
+    void* chain = atomic_exchange_explicit(&h->remote_in, NULL,
+                                           memory_order_acquire);
+    int n = 0;
+    while (chain) {
+        void* next = *(void**)chain;
+        /* These are our blocks (owner == h), possibly from many pages. Route
+         * each to its page's owner-free path. */
+        free_to_page(jet_page_of(chain), chain);
+        chain = next;
+        ++n;
+    }
+    return n;
+}
+
 void jet_free(void* ptr) {
     if (JET_UNLIKELY(ptr == NULL)) return;
     JET_STAT_ADD(jet_stat_free_calls, 1);
@@ -308,14 +408,10 @@ void jet_free(void* ptr) {
             tcache_flush(h, cls);
         return;
     }
-    /* Cross-thread free: hand the block back to its owning page's lock-free
-     * remote-free stack (the owner drains it on its next refill). */
-    void* head = atomic_load_explicit(&pg->thread_free, memory_order_relaxed);
-    do {
-        *(void**)ptr = head;
-    } while (!atomic_compare_exchange_weak_explicit(
-        &pg->thread_free, &head, ptr, memory_order_release,
-        memory_order_relaxed));
+    /* Cross-thread free: buffer it into the outgoing remote cache for its
+     * owner heap. No atomics here — the batch is flushed to the owner's inbox
+     * with a single CAS later (snmalloc message passing). */
+    remote_enqueue(h, pg->owner, ptr);
 }
 
 void jet_free_sized(void* ptr, size_t size) {

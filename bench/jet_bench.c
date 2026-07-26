@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <time.h>
 #include <pthread.h>
 
@@ -96,10 +97,70 @@ static void bench_threaded(void) {
            NAME, PC_THREADS, total / dt / 1e6, dt);
 }
 
+/* ── Producer/consumer: THE cross-thread workload ─────────────────────────
+ * Each producer is paired 1:1 with a consumer through a private SPSC ring, so
+ * the benchmark measures the ALLOCATOR's cross-thread path (producer allocs,
+ * consumer frees the other thread's memory) rather than shared-queue CAS
+ * contention. This is exactly snmalloc's producer/consumer target workload. */
+#define PC_PAIRS   4
+#define PC_QCAP    4096
+#define PC_XFERS   (12 * 1000 * 1000)   /* per pair */
+typedef struct { _Atomic(void*) slot[PC_QCAP]; } spsc;
+static spsc pcq[PC_PAIRS];
+
+static void* producer(void* arg) {
+    long id = (long)arg;
+    spsc* q = &pcq[id];
+    unsigned seed = (unsigned)id * 0x9E3779B1u + 1;
+    long head = 0;
+    for (long i = 0; i < PC_XFERS; ++i) {
+        seed = seed * 1103515245u + 12345u;
+        void* p = ALLOC(16 + ((seed >> 6) % 240));
+        *(volatile char*)p = 1;
+        unsigned s = head & (PC_QCAP - 1);
+        while (atomic_load_explicit(&q->slot[s], memory_order_acquire) != NULL)
+            ;                       /* wait for the consumer to drain a slot */
+        atomic_store_explicit(&q->slot[s], p, memory_order_release);
+        head++;
+    }
+    return NULL;
+}
+static void* consumer(void* arg) {
+    long id = (long)arg;
+    spsc* q = &pcq[id];
+    long tail = 0;
+    for (long i = 0; i < PC_XFERS; ++i) {
+        unsigned s = tail & (PC_QCAP - 1);
+        void* p;
+        while ((p = atomic_load_explicit(&q->slot[s], memory_order_acquire)) == NULL)
+            ;
+        atomic_store_explicit(&q->slot[s], NULL, memory_order_release);
+        FREE(p);                    /* cross-thread free: producer allocated it */
+        tail++;
+    }
+    return NULL;
+}
+static void bench_producer_consumer(void) {
+    for (int i = 0; i < PC_PAIRS; ++i)
+        for (int j = 0; j < PC_QCAP; ++j)
+            atomic_store(&pcq[i].slot[j], NULL);
+    pthread_t p[PC_PAIRS], c[PC_PAIRS];
+    double t0 = now_s();
+    for (long i = 0; i < PC_PAIRS; ++i) pthread_create(&c[i], NULL, consumer, (void*)i);
+    for (long i = 0; i < PC_PAIRS; ++i) pthread_create(&p[i], NULL, producer, (void*)i);
+    for (int i = 0; i < PC_PAIRS; ++i) pthread_join(p[i], NULL);
+    for (int i = 0; i < PC_PAIRS; ++i) pthread_join(c[i], NULL);
+    double dt = now_s() - t0;
+    double total = (double)PC_PAIRS * PC_XFERS;   /* each xfer = 1 alloc+1 free */
+    printf("  %-14s prod/cons(%dpr)    %8.1f Mops/s  (%.2fs)\n",
+           NAME, PC_PAIRS, total / dt / 1e6, dt);
+}
+
 int main(void) {
     printf("== %s ==\n", NAME);
     bench_small_fixed();
     bench_mixed_size();
     bench_threaded();
+    bench_producer_consumer();
     return 0;
 }
