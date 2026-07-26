@@ -75,6 +75,17 @@ static jet_heap* heap_create(void) {
     jet_heap* h = (jet_heap*)jet_large_alloc(sizeof(jet_heap), JET_PAGE_SIZE);
     if (!h) return NULL;
     memset(h, 0, sizeof(*h));
+    /* Per-class fast-bin depth, budgeted by BYTES rather than a flat block
+     * count, so every class parks the same working-set size (see
+     * JET_TCACHE_BYTES). Computed once per thread here, then read straight
+     * out of the bin on the hot path — it shares the bin's cache line with
+     * head and count, so the cap test costs no extra memory traffic. */
+    for (unsigned c = 0; c < JET_NUM_CLASSES; ++c) {
+        uint32_t d = JET_TCACHE_BYTES / jet_class_size[c];
+        if (d > JET_TCACHE_MAX) d = JET_TCACHE_MAX;
+        if (d < JET_TCACHE_MIN) d = JET_TCACHE_MIN;
+        h->bin[c].cap = d;
+    }
     /* Push onto the registry (lock-free). */
     jet_heap* head = atomic_load_explicit(&heap_registry, memory_order_relaxed);
     do {
@@ -320,7 +331,7 @@ static void place_drain_pages(jet_heap* h) {
 static void tcache_batch_fill(jet_heap* h, int cls) {
     jet_page* pg = h->active[cls];
     if (JET_UNLIKELY(pg == NULL)) return;
-    uint32_t want = JET_TCACHE_MAX / 2;
+    uint32_t want = h->bin[cls].cap / 2;
     void* head = h->bin[cls].head;
     uint32_t got = 0;
     while (got < want && page_has_room(pg)) {
@@ -466,7 +477,7 @@ static void free_to_page(jet_page* pg, void* ptr) {
  * may belong to different pages; free_to_page routes each correctly. */
 static void tcache_flush(jet_heap* h, unsigned cls) {
     void* node = h->bin[cls].head;
-    uint32_t keep = JET_TCACHE_MAX / 2;
+    uint32_t keep = h->bin[cls].cap / 2;
     /* Walk to the split point, keeping the first `keep` nodes cached. */
     for (uint32_t i = 1; i < keep && node; ++i)
         node = *(void**)node;
@@ -625,7 +636,7 @@ void jet_free(void* ptr) {
         unsigned cls = pg->cls;
         *(void**)ptr = h->bin[cls].head;
         h->bin[cls].head = ptr;
-        if (JET_UNLIKELY(++h->bin[cls].count > JET_TCACHE_MAX))
+        if (JET_UNLIKELY(++h->bin[cls].count > h->bin[cls].cap))
             tcache_flush(h, cls);
         return;
     }
@@ -643,7 +654,7 @@ void jet_free(void* ptr) {
         unsigned cls = pg->cls;
         *(void**)ptr = h->bin[cls].head;
         h->bin[cls].head = ptr;
-        if (JET_UNLIKELY(++h->bin[cls].count > JET_TCACHE_MAX))
+        if (JET_UNLIKELY(++h->bin[cls].count > h->bin[cls].cap))
             tcache_flush(h, cls);
         return;
     }

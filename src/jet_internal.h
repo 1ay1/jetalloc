@@ -157,17 +157,29 @@ typedef struct jet_page {
 /* Thread-cache depth: how many recycled blocks per class we hold in the heap's
  * fast bins before flushing surplus back to their pages. Bounds cache memory
  * while keeping the alloc/free hot path off the page headers most of the time. */
-#define JET_TCACHE_MAX 1024   /* per-class fast-bin depth. Deeper bins amortise
-                               * the alloc slow path (page refill + cross-thread
-                               * inbox drain) over far more ops. Swept repeatedly:
-                               * 64 -> 256 gave prod/cons 62 -> 103, and once the
-                               * page-header repack removed the old cache-layout
-                               * penalty, 256 -> 1024 gave a further prod/cons
-                               * 102 -> 121 with small-fixed / mixed / threaded all
-                               * flat. 2048 adds ~nothing. Costs NO extra memory:
-                               * measured peak RSS is identical at 256 and 1024
-                               * (23.1 MB), because tcache_flush still returns the
-                               * LRU half of each over-cap bin to its pages. */
+#define JET_TCACHE_MAX 1024   /* per-class fast-bin depth CEILING. See
+                               * JET_TCACHE_BYTES: the effective cap is now
+                               * per-class (byte-budgeted) and this is just the
+                               * upper clamp for the small classes.
+                               * Swept repeatedly: 64 -> 256 gave prod/cons
+                               * 62 -> 103, and once the page-header repack
+                               * removed the old cache-layout penalty,
+                               * 256 -> 1024 gave a further prod/cons 102 -> 121
+                               * with small-fixed / mixed / threaded all flat. */
+
+/* Per-class byte budget for a fast bin. A FLAT block count is the wrong knob:
+ * at 1024 blocks the 16 B class parks 16 KiB (fine — it fits L1/L2 and the
+ * depth is what makes prod/cons fast), but the 32 KiB class parks 32 MiB in a
+ * single bin, per thread. That is pure cache pollution and pure RSS: those
+ * blocks are far too large to ever be cache-resident, so holding 1024 of them
+ * buys nothing that holding 8 doesn't, and it strands memory the rest of the
+ * program could use.
+ *
+ * Budgeting by BYTES gives every class the same cache footprint: depth =
+ * JET_TCACHE_BYTES / class_size, clamped to [JET_TCACHE_MIN, JET_TCACHE_MAX].
+ * Small classes keep their full deep bin, large classes get a shallow one. */
+#define JET_TCACHE_BYTES  (1024u * 1024u)   /* per-class bin budget */
+#define JET_TCACHE_MIN    8u              /* never so shallow it thrashes */
 
 /* ── Cross-thread (remote) free: batched message passing ──────────────────
  * A remote free (this thread frees a block owned by ANOTHER thread's heap)
@@ -246,7 +258,7 @@ typedef struct jet_remote_bucket {
 typedef struct jet_bin {
     void*    head;    /* LIFO of recycled blocks, intrusively linked */
     uint32_t count;   /* blocks currently parked here                */
-    uint32_t _pad;    /* -> 16 B: index by shift, naturally aligned  */
+    uint32_t cap;     /* per-class depth limit — see JET_TCACHE_BYTES */
 } jet_bin;
 
 typedef struct jet_heap {
@@ -474,7 +486,7 @@ static JET_ALWAYS_INLINE int jet_free_inline(void* ptr) {
         unsigned cls = pg->cls;
         *(void**)ptr = h->bin[cls].head;
         h->bin[cls].head = ptr;
-        if (JET_UNLIKELY(++h->bin[cls].count > JET_TCACHE_MAX))
+        if (JET_UNLIKELY(++h->bin[cls].count > h->bin[cls].cap))
             jet_tcache_flush_pub(h, cls);
         return 1;
     }
