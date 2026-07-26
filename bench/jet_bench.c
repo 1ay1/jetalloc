@@ -71,7 +71,11 @@ static void bench_mixed_size(void) {
 }
 
 #define PC_THREADS 8
-#define PC_OPS     (5 * 1000 * 1000)
+/* 40M ops/thread: the old 5M finished in ~0.03 s, which measured thread
+ * creation + first-touch page faults far more than allocator steady state
+ * (run-to-run spread was as wide as the gaps between allocators). At 40M the
+ * run is ~0.3 s and dominated by the actual alloc/free loop. */
+#define PC_OPS     (40 * 1000 * 1000)
 static void* pc_worker(void* arg) {
     unsigned seed = (unsigned)(uintptr_t)arg * 2654435761u + 1;
     void* keep[64] = {0};
