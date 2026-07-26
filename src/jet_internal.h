@@ -426,6 +426,12 @@ static JET_ALWAYS_INLINE void* jet_malloc_inline(size_t size) {
     void* b = h->tcache[cls];
     if (JET_LIKELY(b != NULL)) {
         h->tcache[cls] = *(void**)b;
+        /* The decrement looks like it could be dropped (tcount is only READ on
+         * the free path's over-cap test, and tcache_flush recounts). It cannot:
+         * measured small-fixed 286 -> 221 Mops/s. Without it tcount climbs
+         * monotonically, so once it passes JET_TCACHE_MAX every subsequent free
+         * calls tcache_flush, and each call walks JET_TCACHE_MAX/2 list nodes to
+         * find the split point. Don't remove it. */
         h->tcount[cls]--;
         return b;
     }
