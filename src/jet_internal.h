@@ -90,20 +90,26 @@ static JET_ALWAYS_INLINE int jet_size_class_fast(size_t size) {
  * blocks back through the normal owner-free path when it drains.
  */
 typedef struct jet_page {
-    /* ---- hot: touched on the alloc fast path (keep in the first cache line) */
-    void*             alloc_free;     /* recycled-block pop list (hot)         */
+    /* ---- hot: touched on the alloc AND owner-free fast paths. Everything the
+     * two hot paths read must live in the FIRST cache line (offsets 0..63):
+     *   alloc fast path reads alloc_free / bump / bump_end / block_size / used
+     *   owner-free fast path reads owner (== tls_heap?) and cls (bin index)
+     * Keeping owner+cls here means a free touches ONE line, not two — they used
+     * to straddle the 64 B boundary (owner at 56, cls at 68), costing the free
+     * path a second cache-line reference on every call. */
+    void*             alloc_free;     /* recycled-block pop list (hot)   off 0 */
     uint8_t*          bump;           /* bump cursor: never-yet-used region    */
     uint8_t*          bump_end;       /* one past the last bumpable block      */
+    struct jet_heap*  owner;          /* heap that owns this page (free reads) */
     uint32_t          block_size;     /* bytes per block (a class size)        */
     uint32_t          used;           /* blocks currently allocated            */
+    uint16_t          cls;            /* size-class index (free reads)         */
+    uint16_t          flags;          /* JET_PG_* state (see jet_core.c)       */
+    uint32_t          capacity;       /* total blocks in the page              */
     /* ---- warm: free bookkeeping + list membership (owner-only)              */
     void*             local_free;     /* owner-thread deferred frees           */
     struct jet_page*  next;           /* intrusive: partial/full page lists    */
     struct jet_page*  prev;
-    struct jet_heap*  owner;          /* heap that owns this page              */
-    uint32_t          capacity;       /* total blocks in the page              */
-    uint16_t          cls;            /* size-class index                      */
-    uint16_t          flags;          /* JET_PG_* state (see jet_core.c)       */
     /* ---- TEMPERATURE (place-based free, experimental JET_PLACE path) --------
      * A page classifies ITSELF by observed free traffic, so the free path can
      * pick a policy from the block's ADDRESS alone — no owner lookup, no thread
