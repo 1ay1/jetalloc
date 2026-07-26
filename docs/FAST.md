@@ -366,3 +366,69 @@ Every number here is traceable to a shipping allocator's source. None of it is
 speculative; the only open question is how much each moves *jetalloc's* numbers
 on *your* CPU, which is why each lands as its own commit with a before/after
 bench.
+
+---
+
+## Tier S+ — shipped: fuse the per-class metadata  ✅ (small-fixed 282 -> 313)
+
+The fast-bin head and the fast-bin count are read together by **every** malloc
+and **every** free, yet they lived in two parallel arrays (`tcache[39]`,
+`tcount[39]`) 312 bytes apart. Every single operation therefore touched two
+distinct cache lines and burned two L1 entries and two prefetch streams to
+manipulate what is logically one 12-byte object.
+
+Fusing them into `jet_bin { void* head; uint32_t count; uint32_t cap; }` makes a
+tight single-class malloc/free loop touch **one line**. Measured +13% on
+small-fixed — which flipped that row from #2 (behind tcmalloc) to #1.
+
+Two sub-lessons, both measured:
+- **Pad to 16, don't pack to 12.** The packed variant was slower on every
+  workload: unaligned `head` loads and a multiply instead of a shift to index.
+- **The freed padding word is not free real estate to waste** — putting the
+  per-class bin cap there made the cap test cost *zero* extra memory traffic,
+  because the line is already resident.
+
+### Byte-budget the bins, don't count blocks ✅
+A flat `JET_TCACHE_MAX` is the wrong knob at both ends: 1024 blocks of the 16 B
+class is a 16 KiB cache-resident bin (good, and what makes prod/cons fast),
+while 1024 blocks of the 32 KiB class is **32 MiB parked per thread** in memory
+that can never be cache-resident. Each bin now caps at
+`JET_TCACHE_BYTES / class_size` clamped to [8, 1024]. Swept 64K/256K/1M/4M —
+1 MiB is the knee. Speed unchanged-to-up, large-class bloat gone.
+
+---
+
+## Measured NEGATIVE results — do not re-try these
+
+Things that *should* work by the usual reasoning and do not on this workload.
+Each was implemented, measured against a median-of-7/9 baseline, and reverted.
+
+- **Draining the cross-thread inbox straight into the fast bin.** Looks like a
+  pure win (it skips the local_free -> alloc_free -> bin triple hop). Measured
+  **142 -> 109 Mops/s** on prod/cons. Returning blocks via the page keeps them
+  page-grouped for the batch refill; short-circuiting to the bin destroys that
+  locality and starves the batch path.
+- **Splicing same-page runs during the drain.** Instrumented the actual chain:
+  average same-page run length is **1.11**. Recycling through the bins
+  interleaves pages, so there are no runs to splice. Neutral, reverted.
+  Keeping a run open across the whole walk (flush only on page change) is also
+  neutral — the drain simply is not hot enough to matter.
+- **Software-prefetching the next block's page header in the drain.** The walk
+  looks like a classic dependent-miss chain, and `next` is known one iteration
+  ahead, so this should pipeline the misses. Measured flat.
+- **Branchless size→class computation** (`clz` + 4 sub-classes per power of two,
+  mimalloc/jemalloc style) to replace the 2 KiB lookup table. Microbenchmarked
+  in isolation on the real size distribution: table **1.45 ns/op**, branchless
+  **1.76 ns/op**. The table is L1-resident and wins; the ALU version also does
+  not reproduce this ladder's exact boundaries.
+- **Raising the shared-hot batch budget past 2 MiB.** Swept
+  128K/256K/512K/1M/2M/4M/8M/16M: prod/cons rises monotonically to 2 MiB
+  (141) then falls off (4M: 130, 8M: 114, 16M: 95). 2 MiB is a true optimum,
+  not a floor — the knob is exhausted.
+
+### Benchmark methodology note
+`mixed-size` ran 10M ops in ~0.05 s — comfortably inside timer and scheduler
+noise, with run-to-run spread larger than most effects being measured. It has
+been scaled to 80M ops (~0.4 s). **Any allocator conclusion drawn from the old
+mixed row is unreliable.** Sub-0.1 s benchmark rows should be treated as noise.
+
