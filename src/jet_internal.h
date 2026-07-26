@@ -35,6 +35,21 @@
 /* Slab pages are carved from larger OS spans to amortise mmap syscalls. */
 #define JET_SPAN_SIZE      (4u * 1024u * 1024u)   /* 4 MiB = 64 pages       */
 
+/* The per-CPU (rseq) cache is an OPT-IN experiment (JET_PERCPU=1) that measured
+ * NOT a win on a 12-core box — an already-lock-free per-thread tcache beats it
+ * when thread count ≈ core count. Checking `jet_percpu_on` cost a global load on
+ * EVERY malloc and EVERY free of the interposed fast path, so it is compiled OUT
+ * of the inline drop-in paths by default: measured +3.5% on small-fixed (won all
+ * 7 paired runs, 285-292 vs 273-283 Mops/s) with threaded a wash.
+ *
+ * JET_PERCPU=1 still works at runtime — the OUT-OF-LINE jet_malloc/jet_free (used
+ * by the static library, the C++ operators, and every non-fast-path fall-through)
+ * honour it. Only the interposed leaf fast path skips the check. Build with
+ * -DJET_STRIP_PERCPU=0 to restore the check on the inline path too. */
+#ifndef JET_STRIP_PERCPU
+#define JET_STRIP_PERCPU 1
+#endif
+
 /* Requests larger than this bypass slabs and go straight to mmap. */
 #define JET_LARGE_THRESHOLD (32u * 1024u)
 
@@ -380,7 +395,9 @@ void  jet_tcache_flush_pub(jet_heap* h, unsigned cls); /* over-cap flush        
 static JET_ALWAYS_INLINE void* jet_malloc_inline(size_t size) {
     /* size==0 or > threshold, or per-CPU armed, or no heap yet → full entry. */
     if (JET_UNLIKELY(size - 1 >= JET_LARGE_THRESHOLD)) return jet_malloc(size);
+#if !JET_STRIP_PERCPU
     if (JET_UNLIKELY(jet_percpu_on)) return jet_malloc(size);
+#endif
     jet_heap* h = jet_tls_heap;
     if (JET_UNLIKELY(h == NULL)) return jet_malloc(size);
     int cls = jet_size_class_fast(size);
@@ -398,7 +415,9 @@ static JET_ALWAYS_INLINE void* jet_malloc_inline(size_t size) {
 static JET_ALWAYS_INLINE int jet_free_inline(void* ptr) {
     if (JET_UNLIKELY(ptr == NULL)) return 1;
     if (JET_UNLIKELY(!jet_arena_contains_inline(ptr))) return 0;  /* large/foreign */
+#if !JET_STRIP_PERCPU
     if (JET_UNLIKELY(jet_percpu_on)) return 0;
+#endif
     jet_page* pg = jet_page_of(ptr);
     jet_heap* h = jet_tls_heap;
     if (JET_LIKELY(h != NULL && pg->owner == h)) {
