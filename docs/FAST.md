@@ -398,6 +398,67 @@ that can never be cache-resident. Each bin now caps at
 
 ---
 
+## The producer/consumer ceiling — instrumented, and why it is a hardware wall
+
+prod/cons is the one row jetalloc does not win (145 vs jemalloc 208). This is
+not a missing optimisation; it is a property of the ownership model. Fully
+instrumented on this box (i5-12400F, 4 producer/consumer pairs):
+
+- The **producer reuses a warm recycled block only ~46% of the time**; the
+  other 54% it bump-mints from a page's fresh region. `bump=25.7M reuse=22.3M`.
+- It recycles **~79k pages per run** (`recycled=79032 bump=135 new_span=3`), so
+  it is NOT faulting cold OS memory — THP is on and pages come from the free
+  list. The cost is that a recycled page's blocks were **last written by the
+  consumer on a different core**, so re-handing them out pays a cross-core
+  cache-line transfer (MOESI M→owned migration) per block.
+- The SPSC queue itself is not the limit: a queue-only microbench runs
+  ~1900 Mops/s. A microbench that models the exact block read/write traffic
+  with a fixed recycled pool tops out at **~300 Mops/s** — that is the wall.
+
+jemalloc wins here because its consumer frees into its **own** thread cache and
+those blocks are what its arena hands back, so the hot reuse stays on one core.
+That trades away home-thread locality (which is why jetalloc beats it on the
+other three rows). Matching jemalloc on this workload means giving the consumer
+a local free cache that reallocs foreign blocks without routing them home —
+which breaks jetalloc's no-per-object-header, address-is-the-owner invariant.
+Not worth regressing three wins for one.
+
+Things tried against this ceiling, all measured, all reverted:
+- **Draining the inbox straight into the fast bin** (bounded by cap, no early
+  return): 145 -> 106. Bypassing the page's `used` accounting means pages never
+  retire, so the producer mints *more* fresh pages — worse churn.
+- **Folding the active page's `local_free` into the batch before bump-minting**
+  (prefer warm returned blocks over cold fresh ones): reuse fraction stayed at
+  0.46 because drained blocks land in NON-active pages, and the extra
+  `refill_page` calls regressed mixed 190 -> 172 and prod 141 -> 137.
+- **Deeper tcache** (2K/4K/8K blocks, 4 MiB byte budget) to give the consumer
+  time to return blocks between drains: plateaus at ~134, never breaks through
+  — buffering cannot fix a producer that is structurally faster than the
+  consumer's return path.
+- **Removing the epoch pin** around the buffered cross-thread enqueue (unsafe,
+  measured as a ceiling probe): +2 Mops/s. The pin is a bare TLS load + one
+  LOCK XCHG and is NOT the bottleneck.
+
+The one thing that DID help the row (and mixed, and small-fixed): the
+`jet_epoch_quiesce` lock-free empty-check (see below).
+
+---
+
+## Tier S+ shipped: lock-free `jet_epoch_quiesce` empty-check  ✅ (prod/cons +~7%)
+
+`jet_epoch_quiesce` runs on every alloc slow path (every tcache refill) and
+unconditionally took `limbo_lock` THREE times — once per limbo bag — only to
+find the bags empty, which they almost always are. On a churny stream that is
+hundreds of thousands of uncontended lock round-trips per run doing nothing.
+Making the `limbo[]` bag pointers `_Atomic` lets quiesce RELAXED-read all three
+and return immediately when empty, taking the lock only when there is a page to
+reclaim. Measured prod/cons 131 -> ~145, mixed 178 -> 188, small-fixed 306 ->
+311. Clean under TSan + ASan/UBSan. **Lesson: a spinlock being *uncontended* is
+not the same as being *free* — the acquire/release pair on a cold path called
+500k times still costs, and an atomic pre-check erases it.**
+
+---
+
 ## Measured NEGATIVE results — do not re-try these
 
 Things that *should* work by the usual reasoning and do not on this workload.

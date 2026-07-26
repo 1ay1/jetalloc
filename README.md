@@ -21,24 +21,35 @@ Alder Lake (i5-12400F) box:
 
 | Workload (Mops/s, higher = better) | jetalloc | tcmalloc | mimalloc | jemalloc | glibc |
 |------------------------------------|---------:|---------:|---------:|---------:|------:|
-| **small-fixed (32 B loop)**        | **313** 🏆 |    289   |    260   |    251   |  230  |
-| **mixed-size (8 B–4 KiB)**          | **188** 🏆 |    153   |     62   |    102   |   18  |
-| **threaded (8 threads, same-thread)** | **1225** 🏆 | 1212   |    953   |   1001   | 1241  |
-| producer/consumer (cross-thread)   |    139   |     22   |     75   |  **208** |   13  |
+| **small-fixed (32 B loop)**        | **311** 🏆 |    287   |    261   |    249   |  230  |
+| **mixed-size (8 B–4 KiB)**          | **188** 🏆 |    152   |     62   |    103   |   17  |
+| **threaded (8 threads, same-thread)** | **1303** 🏆 | 1209   |    943   |   1050   | 1305  |
+| producer/consumer (cross-thread)   |    145   |     22   |     76   |  **208** |   12  |
 
-**Honest scorecard.** jetalloc now wins **three of the four**: small-fixed,
-mixed-size (1.2× tcmalloc, 3.0× mimalloc, 10× glibc — the most realistic churn
+**Honest scorecard.** jetalloc wins **three of the four**: small-fixed,
+mixed-size (1.2× tcmalloc, 3.0× mimalloc, 11× glibc — the most realistic churn
 workload) and threaded. Small-fixed used to be its weakest row, trailing
 tcmalloc; fusing each size class's free-list head and count into a single
-cache-line-resident bin (`jet_bin`) took it from 282 to 313 Mops/s and put it in
-first place. On cross-thread producer/consumer it is a clear **#2** — 6.3×
-tcmalloc and 1.9× mimalloc — with jemalloc still ahead, because its
-sharded-arena design caches cross-thread frees on the *consumer* side where
-jetalloc routes each block back to its owner.
+cache-line-resident bin (`jet_bin`) took it from 282 to 311 Mops/s and put it in
+first place.
 
-On `threaded`, glibc's 1241 and jetalloc's 1225 are inside run-to-run noise;
-that workload is dominated by the benchmark's own memory traffic rather than by
-allocator logic.
+On cross-thread producer/consumer it is a clear **#2** — 6.6× tcmalloc and 1.9×
+mimalloc — with jemalloc ahead. This gap is **structural, and understood**: the
+workload is one thread that only allocates and another that only frees, so every
+block is born on the producer's core and dies on the consumer's. jetalloc's
+design routes every freed block back to its owning page, so the producer
+re-hands-out memory the *consumer* last touched — a cross-core cache-line
+transfer per reused block (instrumented: only ~46% of allocations reuse a warm
+block; the rest re-bump a page whose blocks went cold on the other core).
+jemalloc keeps freed blocks in the freeing thread's own cache, trading that
+transfer for weaker home-thread locality. The pure cache-line-transfer ceiling
+for this access pattern measures ~300 Mops/s on this box, so both allocators sit
+well under a hardware wall that no per-object cleverness removes; closing the
+rest would mean abandoning the owner-routing model that wins the other three
+workloads. See `docs/FAST.md` for the full instrumented analysis.
+
+On `threaded`, glibc and jetalloc are inside run-to-run noise; that workload is
+dominated by the benchmark's own memory traffic rather than by allocator logic.
 
 Reproduce it yourself: `./bench/compare.sh 9`. For cycle-level profiling of the
 drop-in hot paths (rdtsc, median-of-N), `bench/jet_cycles.c`.
