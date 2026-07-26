@@ -301,7 +301,13 @@ int    jet_large_owns(const void* ptr);
 
 void* jet_os_map(size_t bytes);            /* JET_PAGE_SIZE-aligned reserve   */
 void* jet_os_map_aligned(size_t bytes, size_t align);
+void* jet_os_map_span(size_t bytes, size_t align);  /* slab span (arena-backed) */
 void  jet_os_unmap(void* p, size_t bytes);
+
+/* Single-compare slab-ownership test: 1 iff ptr lies in the reserved arena.
+ * Zero memory loads — this is what makes free()'s ownership check cheap. */
+int   jet_arena_contains(const void* ptr);
+int   jet_arena_disabled(void);            /* 1 iff arena reservation failed  */
 
 /* ── NUMA / topology-aware placement (jet_numa.c) ─────────────────────────
  * Bind freshly-mapped spans to the local NUMA node so a thread's allocations
@@ -335,6 +341,52 @@ extern _Atomic(size_t) jet_stat_free_calls;
 
 static JET_ALWAYS_INLINE jet_page* jet_page_of(const void* block) {
     return (jet_page*)((uintptr_t)block & JET_PAGE_MASK);
+}
+
+/* ── Inline drop-in fast paths (used by jet_override.c) ────────────────────
+ * The interposed malloc/free/calloc call these so the common bin-hit case is a
+ * LEAF — no cross-TU call to jet_malloc/jet_free/jet_owns on every allocation,
+ * which is what let mimalloc/tcmalloc beat a naive drop-in. They defer to the
+ * slow-path entrypoints only on a miss / unusual case. Defined here (after the
+ * full jet_page + jet_heap types) so both jet_core.c and jet_override.c inline
+ * the identical code. */
+extern _Thread_local jet_heap* jet_tls_heap;
+void* jet_malloc_refill(jet_heap* h, int cls);      /* bin empty → refill+pop  */
+void  jet_tcache_flush_pub(jet_heap* h, unsigned cls); /* over-cap flush        */
+
+static JET_ALWAYS_INLINE void* jet_malloc_inline(size_t size) {
+    /* size==0 or > threshold, or per-CPU armed, or no heap yet → full entry. */
+    if (JET_UNLIKELY(size - 1 >= JET_LARGE_THRESHOLD)) return jet_malloc(size);
+    if (JET_UNLIKELY(jet_percpu_on)) return jet_malloc(size);
+    jet_heap* h = jet_tls_heap;
+    if (JET_UNLIKELY(h == NULL)) return jet_malloc(size);
+    int cls = jet_size_class_fast(size);
+    void* b = h->tcache[cls];
+    if (JET_LIKELY(b != NULL)) {
+        h->tcache[cls] = *(void**)b;
+        h->tcount[cls]--;
+        return b;
+    }
+    return jet_malloc_refill(h, cls);
+}
+
+/* Returns 1 if the free was fully handled here (owner-fast bin push), 0 if the
+ * caller must take the full jet_free() path (cross-thread, large, or foreign). */
+static JET_ALWAYS_INLINE int jet_free_inline(void* ptr) {
+    if (JET_UNLIKELY(ptr == NULL)) return 1;
+    if (JET_UNLIKELY(!jet_arena_contains(ptr))) return 0;  /* large/foreign      */
+    if (JET_UNLIKELY(jet_percpu_on)) return 0;
+    jet_page* pg = jet_page_of(ptr);
+    jet_heap* h = jet_tls_heap;
+    if (JET_LIKELY(h != NULL && pg->owner == h)) {
+        unsigned cls = pg->cls;
+        *(void**)ptr = h->tcache[cls];
+        h->tcache[cls] = ptr;
+        if (JET_UNLIKELY(++h->tcount[cls] > JET_TCACHE_MAX))
+            jet_tcache_flush_pub(h, cls);
+        return 1;
+    }
+    return 0;   /* cross-thread / no heap yet → full path */
 }
 
 #endif /* JETALLOC_INTERNAL_H */

@@ -56,6 +56,14 @@ target_include_directories(jetalloc_preload PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_link_libraries(jetalloc_preload PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
 set_target_properties(jetalloc_preload PROPERTIES OUTPUT_NAME jetalloc)
+# LTO so the interposed malloc/free/calloc collapse the whole fast path into a
+# single leaf function — no cross-TU PLT/GOT call to jet_malloc/jet_free/jet_owns
+# on every allocation. This is the difference between competing with and losing
+# to mimalloc/tcmalloc through the drop-in interface.
+if(NOT MSVC)
+    set_target_properties(jetalloc_preload PROPERTIES
+        INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
 
 # ── Tests ────────────────────────────────────────────────────────────────
 enable_testing()

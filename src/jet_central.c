@@ -59,8 +59,8 @@ static jet_page* raw_page(int* mem_fresh) {
         return pg;
     }
     if (span_cursor + JET_PAGE_SIZE > span_end) {
-        uint8_t* span = (uint8_t*)jet_os_map_aligned(JET_SPAN_SIZE,
-                                                     JET_PAGE_SIZE);
+        uint8_t* span = (uint8_t*)jet_os_map_span(JET_SPAN_SIZE,
+                                                 JET_PAGE_SIZE);
         if (!span) return NULL;
         span_cursor = span;
         span_end    = span + JET_SPAN_SIZE;

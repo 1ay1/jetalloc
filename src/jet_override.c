@@ -35,13 +35,13 @@ static void resolve_reals(void) {
 /* Visibility: the standard names must be globally visible + not inlined away. */
 #define JET_PUBLIC __attribute__((visibility("default"), used))
 
-JET_PUBLIC void* malloc(size_t size) { return jet_malloc(size); }
+JET_PUBLIC void* malloc(size_t size) { return jet_malloc_inline(size); }
 
 JET_PUBLIC void free(void* ptr) {
-    if (!ptr) return;
+    /* Owner-fast bin push inlines here (leaf); everything else defers. */
+    if (JET_LIKELY(jet_free_inline(ptr))) return;
+    /* Slow / foreign: full path decides ours-vs-libc and cross-thread. */
     if (JET_LIKELY(jet_owns(ptr))) { jet_free(ptr); return; }
-    /* Foreign pointer (allocated by libc before we loaded, or by another
-     * allocator). Forward to the real free instead of corrupting our heap. */
     resolve_reals();
     if (real_free) real_free(ptr);
 }

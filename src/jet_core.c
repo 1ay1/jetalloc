@@ -25,7 +25,8 @@
 
 /* ── Thread heap registry ─────────────────────────────────────────────── */
 
-static _Thread_local jet_heap* tls_heap = NULL;
+_Thread_local jet_heap* jet_tls_heap = NULL;
+#define tls_heap jet_tls_heap
 
 /* All heaps chained for teardown/trim. Guarded by a spinlock (cold). */
 static _Atomic(jet_heap*) heap_registry = NULL;
@@ -470,6 +471,11 @@ static void tcache_flush(jet_heap* h, unsigned cls) {
     }
 }
 
+/* Public wrappers so the inline drop-in fast paths (jet_internal.h, used by the
+ * interposed malloc/free) reach the slow-path continuations across TU bounds. */
+void* jet_malloc_refill(jet_heap* h, int cls) { return tcache_refill(h, cls); }
+void  jet_tcache_flush_pub(jet_heap* h, unsigned cls) { tcache_flush(h, cls); }
+
 /* ── Cross-thread free: batched message passing (snmalloc-style) ───────── */
 
 /* Push a whole chain [first..last] (count nodes) onto owner's inbox with ONE
@@ -776,15 +782,25 @@ int jet_posix_memalign(void** out, size_t alignment, size_t size) {
 
 int jet_owns(const void* ptr) {
     if (!ptr) return 0;
+    /* Fast path: a slab block lives inside the reserved arena — one range
+     * compare, ZERO memory loads. This is the common case and what makes the
+     * drop-in free() competitive with mimalloc/tcmalloc. */
+    if (JET_LIKELY(jet_arena_contains(ptr))) {
+        /* Page-aligned pointers inside the arena would be page headers, never
+         * user blocks, so a genuine slab user pointer is never page-aligned. */
+        return ((uintptr_t)ptr & (JET_PAGE_SIZE - 1)) != 0;
+    }
+    /* Page-aligned pointer outside the arena: possibly a large (direct-mmap)
+     * allocation of ours — validate via its header magic. */
     if (((uintptr_t)ptr & (JET_PAGE_SIZE - 1)) == 0)
         return jet_large_owns(ptr);
-    /* Slab block: its page header must have a plausible block_size / capacity.
-     * We can't fully validate without a span registry, but the aligned-large
-     * check above plus this sanity gate rejects most foreign pointers. A full
-     * span bitmap is a future hardening step. */
-    jet_page* pg = jet_page_of(ptr);
-    return pg->block_size >= 8 && pg->block_size <= JET_LARGE_THRESHOLD &&
-           pg->capacity > 0 && pg->cls < JET_NUM_CLASSES;
+    /* Arena disabled (reservation failed) fallback: sniff the page header. */
+    if (jet_arena_disabled()) {
+        jet_page* pg = jet_page_of(ptr);
+        return pg->block_size >= 8 && pg->block_size <= JET_LARGE_THRESHOLD &&
+               pg->capacity > 0 && pg->cls < JET_NUM_CLASSES;
+    }
+    return 0;   /* not page-aligned, not in arena, arena on → foreign */
 }
 
 void jet_get_stats(jet_stats* out) {
