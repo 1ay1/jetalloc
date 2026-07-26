@@ -16,27 +16,26 @@ Because a system allocator upgrade should never break your binary. jetalloc is
 self-contained (no external dependency, no fragile global `free()` interposition
 that crashes during C++ locale init), and it's *fast* — measured head-to-head
 against the fastest production allocators through the **identical** drop-in
-`malloc`/`free` interface (`LD_PRELOAD`), median of 7 runs on a 12-core
+`malloc`/`free` interface (`LD_PRELOAD`), median of 9 runs on a 12-core
 Alder Lake (i5-12400F) box:
 
 | Workload (Mops/s, higher = better) | jetalloc | tcmalloc | mimalloc | jemalloc | glibc |
 |------------------------------------|---------:|---------:|---------:|---------:|------:|
-| small-fixed (32 B loop)            |    283   |  **290** |    262   |    251   |  228  |
-| **mixed-size (8 B–4 KiB)**          | **178** 🏆 |    150   |     62   |    102   |   17  |
-| **threaded (8 threads, same-thread)** | **1287** |   1220   |    944   |    993   | 1311  |
-| producer/consumer (cross-thread)   |    141   |     22   |     75   |  **212** |   12  |
+| small-fixed (32 B loop)            |    280   |  **291** |    259   |    250   |  229  |
+| **mixed-size (8 B–4 KiB)**          | **193** 🏆 |    150   |     61   |    101   |   17  |
+| **threaded (8 threads, same-thread)** | **1303** 🏆 | 1225   |    955   |   1038   | 1277  |
+| producer/consumer (cross-thread)   |    141   |     22   |     75   |  **208** |   13  |
 
-**Honest scorecard.** jetalloc **wins mixed-size outright** (the most realistic
-churn workload — 1.2× tcmalloc, 2.9× mimalloc, 10× glibc) and **beats every other
-slab allocator on threaded** (only glibc edges it, on a workload of 8 fully
-independent threads with zero sharing that suits a plain per-thread arena — and
-glibc pays for that everywhere else, managing 17 Mops/s on mixed-size). On
-cross-thread producer/consumer it is a solid **#2**: 6.4× tcmalloc and 1.9×
-mimalloc, with jemalloc still ahead — its sharded-arena design caches
-cross-thread frees consumer-side, where jetalloc routes each block to its owner.
-On the tight single-block small-fixed loop it is **#2, within 2.4%** of tcmalloc.
+**Honest scorecard.** jetalloc wins **two of the four outright**: mixed-size
+(1.3× tcmalloc, 3.2× mimalloc, 11× glibc — the most realistic churn workload) and
+threaded (ahead of glibc, tcmalloc, jemalloc and mimalloc alike). On cross-thread
+producer/consumer it is a clear **#2** — 6.4× tcmalloc and 1.9× mimalloc — with
+jemalloc still ahead, because its sharded-arena design caches cross-thread frees
+on the *consumer* side where jetalloc routes each block back to its owner. The
+only workload where it trails meaningfully is the tight single-block small-fixed
+loop, where it is **#2, within 3.8%** of tcmalloc.
 
-Reproduce it yourself: `./bench/compare.sh 7`. For cycle-level profiling of the
+Reproduce it yourself: `./bench/compare.sh 9`. For cycle-level profiling of the
 drop-in hot paths (rdtsc, median-of-N), `bench/jet_cycles.c`.
 
 *(GCC/Clang, x86-64. Numbers vary by CPU; the harness runs the same binary under
