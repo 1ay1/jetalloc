@@ -98,13 +98,12 @@ void jet_epoch_enter(void) {
     jet_epoch_rec* r = epoch_rec();
     if (!r) return;                       /* OOM: degrade to no protection      */
     uint64_t g = atomic_load_explicit(&g_epoch, memory_order_acquire);
-    /* Publish that we are pinned in epoch g. The release/acquire pair with the
-     * reclaimer's scan ensures a reclaimer that reads UNPINNED here happens
-     * before our next load of the page pointer, or observes our pin. */
-    atomic_store_explicit(&r->local, g, memory_order_seq_cst);
-    /* Full fence so the subsequent load of pg->owner cannot be reordered before
-     * the pin becomes visible to a concurrent reclaimer. */
-    atomic_thread_fence(memory_order_seq_cst);
+    /* Publish the pin AND get the StoreLoad barrier in ONE instruction: a
+     * seq_cst exchange compiles to a single LOCK XCHG on x86, which both
+     * publishes r->local and prevents the subsequent load of pg->owner from
+     * being reordered ahead of the pin. This replaces the old store +
+     * standalone mfence (two barriers) on the hot cross-thread free path. */
+    (void)atomic_exchange_explicit(&r->local, g, memory_order_seq_cst);
 }
 
 void jet_epoch_leave(void) {
