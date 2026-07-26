@@ -80,6 +80,31 @@ typedef struct jet_page {
     uint32_t          capacity;       /* total blocks in the page              */
     uint16_t          cls;            /* size-class index                      */
     uint16_t          flags;          /* JET_PG_* state (see jet_core.c)       */
+    /* ---- TEMPERATURE (place-based free, experimental JET_PLACE path) --------
+     * A page classifies ITSELF by observed free traffic, so the free path can
+     * pick a policy from the block's ADDRESS alone — no owner lookup, no thread
+     * identity, no per-target routing. `temp` is a saturating count of foreign
+     * (cross-thread) frees seen; once it crosses JET_TEMP_WARM the page is WARM
+     * and cross-thread frees push straight onto place_head below. HOT pages
+     * (temp low) never touch an atomic. Cheap: one byte, on the warm line. */
+    uint8_t           flags2;         /* (reserved padding for alignment)      */
+    /* `temp` is a saturating count of foreign (cross-thread) frees seen. It is
+     * written from multiple threads on the cross-thread free path, so it is a
+     * RELAXED atomic — a lost update only perturbs the heat estimate, never
+     * correctness, but plain access would be a data race (UB). */
+    _Atomic(uint8_t)  temp;
+    /* Place-drain bookkeeping: `on_drain` is a 0/1 atomic claim ensuring a page
+     * is enqueued on its owner's drain stack AT MOST ONCE while it waits, and
+     * `drain_next` links the owner's lock-free stack of pages that have pending
+     * place_head frees but are not currently reachable via active/partial. */
+    _Atomic(int)               on_drain;
+    _Atomic(struct jet_page*)  drain_next;
+    /* ---- PLACE inbox: page-local MPSC stack of cross-thread frees, on its
+     * OWN cache line so a remote CAS never invalidates the hot alloc line.
+     * Recovered from any block by pure arithmetic (&jet_page_of(b)->place_head)
+     * — the whole point of the place-based model: the address IS the routing.
+     * Only the WARM path uses it; drained by the owner in one exchange. */
+    _Alignas(64) _Atomic(void*) place_head;
 } jet_page;
 
 /* ── Per-thread heap ──────────────────────────────────────────────────── */
@@ -114,6 +139,26 @@ typedef struct jet_page {
 #define JET_SHARED_HOT       8         /* score at which a class is shared-hot */
 #define JET_SHARED_HOT_BYTES (512u*1024u) /* per-bucket byte budget, shared-hot */
 #define JET_SHARED_COLD      24        /* per-bucket flush count, rarely-shared */
+
+/* ── Place-based / temperature-aware free (experimental, JET_PLACE=1) ──────
+ * An alternative cross-thread model that asks WHERE a block lives, not WHO owns
+ * it. Every page self-classifies by observed free traffic:
+ *   HOT  — freed almost only by its owner. Owner path, zero atomics.
+ *   WARM — mixed local/remote. A cross-thread free pushes straight onto the
+ *          page's own place_head (one atomic, addressed purely by page: no
+ *          owner deref, no per-target bucket, no routing). Owner drains in one
+ *          exchange on its slow path.
+ * A page turns WARM after JET_TEMP_WARM foreign frees. When off (default) the
+ * shipped message-passing engine handles cross-thread frees. */
+#define JET_TEMP_WARM        4         /* foreign frees before a page goes WARM */
+#define JET_TEMP_MAX         250       /* saturation cap for the temp counter   */
+
+/* Fast inline guard for the place path (see jet_percpu_on pattern). */
+extern int jet_place_on;
+
+/* Place-based free entry points (jet_core.c). place_free routes a cross-thread
+ * free by address; place_drain folds a page's place_head back to the owner. */
+void jet_place_init(void);
 
 typedef struct jet_remote_bucket {
     struct jet_heap* owner;   /* target heap for this bucket (NULL = empty)    */
@@ -150,6 +195,13 @@ typedef struct jet_heap {
      * via a single atomic push. On its own cache line — remote producers CAS
      * this while we read our hot fields above. */
     _Alignas(64) _Atomic(void*) remote_in;
+    /* Place-based model: lock-free stack of OUR pages that have pending
+     * place_head frees while not reachable via active/partial (i.e. FULL pages
+     * a remote thread freed into). A freer pushes a page here ONCE (guarded by
+     * pg->on_drain); we pop and drain them on the alloc slow path. One atomic
+     * per page-transition, not per free. Own cache line — remote writers CAS
+     * it. */
+    _Alignas(64) _Atomic(struct jet_page*) drain_pages;
 } jet_heap;
 
 /* Access the calling thread's heap (creates on first touch). */

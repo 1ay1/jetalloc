@@ -165,6 +165,33 @@ path never reads it. Measured: **prod/cons 65–70 → 75–80 Mops/s** with the
 three benchmarks unchanged; larger byte budgets push it to ~90 at a memory
 cost, so 512 KiB is the shipped default. TSan + ASan/UBSan clean.
 
+### 4e. Place-based / temperature-aware free — research artifact (JET_PLACE=1)
+**The "stop tracking owners" idea, built and measured.** Instead of asking *who*
+owns a block, ask *where* it lives: recover the page from the block's ADDRESS
+(a mask jetalloc already does), and let the PAGE carry its own free policy — no
+owner-heap dereference, no per-target bucket, no routing table. Each page
+self-classifies by TEMPERATURE (a saturating per-page `temp` counter of foreign
+frees):
+  - **HOT** (few foreign frees): routed through the batched message-passing
+    engine — zero atomics per free.
+  - **WARM** (`temp ≥ JET_TEMP_WARM`): cross-thread frees push straight onto the
+    page's own `_Alignas(64)` MPSC `place_head` (one atomic, address-routed).
+    A FULL page that receives place frees is enqueued ONCE on the owner's
+    lock-free `drain_pages` stack (guarded by `on_drain`, one atomic per
+    page-transition, not per object) so the owner can find and fold it back;
+    accounting is restored by a per-block `used--` on drain.
+
+Fully correct — `alloc=free=live=0` after the mt stress, TSan + ASan/UBSan clean
+(the TSan pass forced `temp` to a relaxed atomic). **Honest result:** on this
+12-core box it does NOT beat the shipped batched engine — place is ~68 vs ~77
+Mops/s prod/cons, and a purpose-built many-owners/bucket-collision bench is a
+wash (~90 vs ~97). The lesson, now proven a THIRD time (after the per-page
+bitmap and per-CPU cache): **a per-object atomic can't beat an amortized batched
+atomic, however clever the routing.** Batching is the local optimum; owner-
+obliviousness is elegant but not faster here. Shipped OFF by default as a
+research path (`JET_PLACE=1`); the frontier for real speed is the same-thread
+fast path, not the cross-thread one.
+
 ### 5. Sized-class → index by one multiply-shift, no table
 **Source:** tcmalloc/mimalloc size-class math. jetalloc uses a 2 KiB lookup
 table. The faster trick used in production: for size `n`, the class is derived by

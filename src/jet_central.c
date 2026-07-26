@@ -83,6 +83,11 @@ static void format_page(jet_page* pg, jet_heap* h, int cls) {
     pg->used        = 0;
     pg->cls         = (uint16_t)cls;
     pg->flags       = 0;
+    pg->flags2      = 0;
+    atomic_store_explicit(&pg->temp, 0, memory_order_relaxed);
+    atomic_store_explicit(&pg->place_head, NULL, memory_order_relaxed);
+    atomic_store_explicit(&pg->on_drain, 0, memory_order_relaxed);
+    atomic_store_explicit(&pg->drain_next, NULL, memory_order_relaxed);
 }
 
 jet_page* jet_central_fresh_page(jet_heap* h, int cls) {

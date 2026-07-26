@@ -17,6 +17,7 @@
  */
 #include "jet_internal.h"
 #include <string.h>
+#include <stdlib.h>          /* getenv (JET_PLACE)                          */
 #ifdef JET_DEBUG
 #  include <stdio.h>
 #  include <stdlib.h>
@@ -49,8 +50,17 @@ static void jet_tls_init(void) { pthread_key_create(&jet_tls_key, jet_thread_exi
 /* One-time per-CPU (rseq) subsystem init, guarded so it runs exactly once for
  * the whole process regardless of which thread allocates first. */
 static pthread_once_t jet_percpu_once = PTHREAD_ONCE_INIT;
-static void jet_percpu_bootstrap(void) { (void)jet_percpu_init(); }
+static void jet_percpu_bootstrap(void) { (void)jet_percpu_init(); jet_place_init(); }
 #endif
+
+/* Place-based / temperature-aware cross-thread free (experimental). Off unless
+ * JET_PLACE is set non-zero. When off, the shipped message-passing engine runs
+ * and jet_place_on stays 0 (one predicted branch on the free path). */
+int jet_place_on = 0;
+void jet_place_init(void) {
+    const char* env = getenv("JET_PLACE");
+    jet_place_on = (env && env[0] != '0' && env[0] != '\0') ? 1 : 0;
+}
 
 static jet_heap* heap_create(void) {
     /* Bootstrap the heap struct itself from a dedicated large alloc so we do
@@ -94,13 +104,30 @@ static void free_to_page(jet_page* pg, void* ptr);
 
 /* Move any recycled blocks (owner-side local_free) into alloc_free so the fast
  * pop path can serve them. Returns 1 if alloc_free is non-empty afterwards.
- * Does NOT touch the bump cursor — the caller bumps. Cross-thread frees never
- * reach a page directly (they arrive via the heap inbox), so there is no atomic
- * remote list to drain here. */
+ * Does NOT touch the bump cursor — the caller bumps.
+ *
+ * In the default model cross-thread frees never reach a page directly. In the
+ * PLACE-BASED model (JET_PLACE=1) they DO: they were pushed onto pg->place_head
+ * by their address, without a used-- (the freer never touched page accounting).
+ * So when we drain place_head we must decrement `used` per block to restore the
+ * invariant "a block on alloc_free is not counted in used". One atomic exchange
+ * grabs the whole remote stack. */
 static int refill_page(jet_page* pg) {
     if (pg->alloc_free) return 1;
     void* reclaimed = pg->local_free;
     pg->local_free = NULL;
+
+    if (jet_place_on) {
+        void* remote = atomic_exchange_explicit(&pg->place_head, NULL,
+                                                memory_order_acquire);
+        while (remote) {
+            void* nxt = *(void**)remote;
+            *(void**)remote = reclaimed;   /* prepend onto reclaimed chain     */
+            reclaimed = remote;
+            pg->used--;                     /* restore accounting for this block */
+            remote = nxt;
+        }
+    }
     pg->alloc_free = reclaimed;
     return pg->alloc_free != NULL;
 }
@@ -197,6 +224,38 @@ static void* alloc_small(jet_heap* h, int cls) {
     return page_pop(pg);
 }
 
+/* Owner side of the place-based model: pop every page from our drain stack and
+ * fold its accumulated place_head frees back in. Called on the alloc slow path
+ * (a quiescent point). For each drained page we clear on_drain FIRST so a
+ * concurrent freer that arrives after our exchange re-enqueues the page rather
+ * than losing its free. Then we drain place_head via refill_page's accounting
+ * and re-file the page: empty → epoch-retire, otherwise → partial (discoverable
+ * for future allocs). Pages still ACTIVE/PARTIAL are left in place (their
+ * place_head is drained lazily by refill_page anyway). */
+static void place_drain_pages(jet_heap* h) {
+    jet_page* pg = atomic_exchange_explicit(&h->drain_pages, NULL,
+                                            memory_order_acquire);
+    while (pg) {
+        jet_page* nxt = atomic_load_explicit(&pg->drain_next, memory_order_relaxed);
+        /* Release our claim before draining: a free racing in now re-enqueues. */
+        atomic_store_explicit(&pg->on_drain, 0, memory_order_release);
+
+        if (pg->flags == JET_PG_FULL) {
+            /* Fold place frees into alloc_free (refill_page does the used--). */
+            if (refill_page(pg)) {
+                if (JET_UNLIKELY(pg->used == 0)) {
+                    jet_epoch_retire(pg);
+                } else {
+                    partial_push(h, pg);   /* now has free blocks → discoverable */
+                }
+            }
+        }
+        /* ACTIVE/PARTIAL pages: leave them; refill_page drains place_head when
+         * the owner next touches the page. */
+        pg = nxt;
+    }
+}
+
 /* Batch-refill: pull up to `want` blocks out of the heap's pages into the
  * class fast bin, then return one. Amortizes the alloc_small / page-header /
  * TLS overhead across a whole batch (transfer-cache idea, tcmalloc). Returns
@@ -210,6 +269,11 @@ static void* tcache_refill(jet_heap* h, int cls) {
      * so their memory re-enters our pages before we consider minting more. */
     if (JET_UNLIKELY(atomic_load_explicit(&h->remote_in, memory_order_relaxed)))
         remote_drain(h);
+    /* Place-based model: fold back any pages remote threads freed into while
+     * they were FULL (unreachable via our lists). */
+    if (JET_UNLIKELY(jet_place_on &&
+                     atomic_load_explicit(&h->drain_pages, memory_order_relaxed)))
+        place_drain_pages(h);
 
     /* Grab the first block the normal way (also mints a page if needed). */
     void* first = alloc_small(h, cls);
@@ -470,6 +534,52 @@ void jet_free(void* ptr) {
         h->tcache[cls] = ptr;
         if (JET_UNLIKELY(++h->tcount[cls] > JET_TCACHE_MAX))
             tcache_flush(h, cls);
+        return;
+    }
+    /* PLACE-BASED / TEMPERATURE-AWARE path (experimental, JET_PLACE=1).
+     * Ownership doesn't route the block — its ADDRESS does. But we don't pay a
+     * per-object atomic on every cross-thread free: a page must EARN it. Each
+     * foreign free heats the page; while it is still HOT (few foreign frees) we
+     * route through the cheap BATCHED message-passing engine (zero atomics per
+     * free, one CAS per batch). Only once a page proves genuinely contended
+     * (temp >= JET_TEMP_WARM) do cross-thread frees push straight onto its own
+     * place_head — at which point the page-local MPSC + owner-drains-in-one-
+     * exchange beats re-bucketing a hot stream. So HOT pages get batching's
+     * throughput and WARM pages get place's routing-free directness. */
+    if (JET_UNLIKELY(jet_place_on)) {
+        uint8_t t = atomic_load_explicit(&pg->temp, memory_order_relaxed);
+        if (t < JET_TEMP_MAX)
+            atomic_store_explicit(&pg->temp, (uint8_t)(t + 1), memory_order_relaxed);
+        if (t < JET_TEMP_WARM) {
+            /* Still HOT: batch it (no per-object atomic). */
+            remote_enqueue(h, owner, pg->cls, ptr);
+            jet_epoch_leave();
+            return;
+        }
+        /* WARM: place it by address — one atomic, no bucket, no owner routing. */
+        void* head = atomic_load_explicit(&pg->place_head, memory_order_relaxed);
+        do {
+            *(void**)ptr = head;
+        } while (!atomic_compare_exchange_weak_explicit(
+            &pg->place_head, &head, ptr, memory_order_release,
+            memory_order_relaxed));
+        /* Make the owner able to FIND this page. active/partial pages are
+         * reached on the owner's alloc path anyway, but a FULL page (dropped
+         * from every list) would otherwise strand its place frees forever. So
+         * enqueue the page on the owner's lock-free drain stack — exactly once
+         * per outstanding burst, claimed via on_drain (0→1). The owner clears
+         * on_drain when it drains, so a later free re-enqueues. This is one
+         * atomic per page-transition, not per object. */
+        if (atomic_exchange_explicit(&pg->on_drain, 1, memory_order_acq_rel) == 0) {
+            jet_page* dh = atomic_load_explicit(&owner->drain_pages,
+                                                memory_order_relaxed);
+            do {
+                atomic_store_explicit(&pg->drain_next, dh, memory_order_relaxed);
+            } while (!atomic_compare_exchange_weak_explicit(
+                &owner->drain_pages, &dh, pg, memory_order_release,
+                memory_order_relaxed));
+        }
+        jet_epoch_leave();
         return;
     }
     remote_enqueue(h, owner, pg->cls, ptr);
