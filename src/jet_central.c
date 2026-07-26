@@ -60,7 +60,8 @@ static jet_page* raw_page(void) {
  * 64 KiB page up front. Instead we set a BUMP cursor over the data region:
  * the first `capacity` allocations are pure pointer arithmetic (bump += bs),
  * touching memory only as it's actually handed out. Recycled blocks later
- * flow through alloc_free/local_free/thread_free. */
+ * flow through alloc_free/local_free (owner-local; cross-thread frees go to the
+ * owner heap's inbox, never the page). */
 static void format_page(jet_page* pg, jet_heap* h, int cls) {
     uint32_t bs = jet_class_size[cls];
 
@@ -74,7 +75,6 @@ static void format_page(jet_page* pg, jet_heap* h, int cls) {
     pg->bump        = (uint8_t*)data;       /* hand out fresh blocks from here */
     pg->bump_end    = (uint8_t*)(data + (size_t)cap * bs);
     pg->local_free  = NULL;
-    atomic_store_explicit(&pg->thread_free, NULL, memory_order_relaxed);
     pg->next        = NULL;
     pg->prev        = NULL;
     pg->owner       = h;

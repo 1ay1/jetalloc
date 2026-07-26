@@ -3,14 +3,17 @@
  * SPDX-License-Identifier: MIT
  *
  * FAST PATHS (the whole point of the allocator):
- *   jet_malloc small  → heap->active[cls]->alloc_free pop  (no atomics, no lock)
- *   jet_free   small   → if owner-thread: push onto page->local_free (no atomics)
- *                        else: atomic Treiber push onto page->thread_free
+ *   jet_malloc small  → heap->tcache[cls] pop, else active page pop (no atomics)
+ *   jet_free   small   → if owner-thread: push onto heap->tcache[cls] (no atomics)
+ *                        else: buffer into the outgoing remote cache, later
+ *                              flushed to the OWNER HEAP's inbox with one CAS
+ *                              per batch (snmalloc-style message passing)
  *
- * The active-page free list (alloc_free) is refilled lazily: when it empties we
- * (1) steal the page's own local_free, (2) drain its atomic thread_free, and
- * only if still empty do we go find/mint another page. This keeps the common
- * same-thread alloc/free loop entirely in the L1-resident page header.
+ * A page is entirely owner-private: cross-thread frees never touch it. They are
+ * routed to the owning heap's inbox (remote_in) and folded back into the
+ * owner's pages when it next drains on the alloc slow path. So the common
+ * same-thread alloc/free loop stays in L1-resident owner-only state and the
+ * cross-thread path pays zero atomics per object (one CAS per flushed batch).
  */
 #include "jet_internal.h"
 #include <string.h>
@@ -89,35 +92,16 @@ jet_heap* jet_thread_heap(void) {
 static int  remote_drain(jet_heap* h);
 static void free_to_page(jet_page* pg, void* ptr);
 
-/* Drain a page's atomic cross-thread free list into a plain pointer chain,
- * returning the head. Lock-free: single atomic exchange grabs the whole stack. */
-static inline void* drain_thread_free(jet_page* pg) {
-    return atomic_exchange_explicit(&pg->thread_free, NULL,
-                                    memory_order_acquire);
-}
-
-/* Concatenate list `b` onto the tail is O(n); instead we just prepend, since
- * ordering within a page's free list is irrelevant to correctness. */
-static inline void* splice(void* head, void* other) {
-    if (!other) return head;
-    if (!head)  return other;
-    /* walk `other` to its tail, link to head. `other` lists are short (one
-     * refill's worth), so this is cheap and keeps everything intrusive. */
-    void* p = other;
-    while (*(void**)p) p = *(void**)p;
-    *(void**)p = head;
-    return other;
-}
-
-/* Move any recycled blocks (owner local_free + cross-thread thread_free) into
- * alloc_free so the fast pop path can serve them. Returns 1 if alloc_free is
- * non-empty afterwards. Does NOT touch the bump cursor — the caller bumps. */
+/* Move any recycled blocks (owner-side local_free) into alloc_free so the fast
+ * pop path can serve them. Returns 1 if alloc_free is non-empty afterwards.
+ * Does NOT touch the bump cursor — the caller bumps. Cross-thread frees never
+ * reach a page directly (they arrive via the heap inbox), so there is no atomic
+ * remote list to drain here. */
 static int refill_page(jet_page* pg) {
     if (pg->alloc_free) return 1;
     void* reclaimed = pg->local_free;
     pg->local_free = NULL;
-    void* remote = drain_thread_free(pg);
-    pg->alloc_free = splice(reclaimed, remote);
+    pg->alloc_free = reclaimed;
     return pg->alloc_free != NULL;
 }
 
@@ -280,44 +264,39 @@ void* jet_malloc(size_t size) {
 
 static void free_to_page(jet_page* pg, void* ptr) {
     jet_heap* h = jet_thread_heap();
-    if (JET_LIKELY(pg->owner == h)) {
-        /* Owner-thread free: push to local_free, no atomics. */
-        *(void**)ptr = pg->local_free;
-        pg->local_free = ptr;
-        pg->used--;
+    /* INVARIANT: free_to_page is only ever called for pages this heap owns.
+     * Its two callers — tcache_flush (surplus of the owner's own frees) and
+     * remote_drain (blocks other threads returned to OUR inbox, i.e. our
+     * blocks) — both pass owner-owned pages. Cross-thread frees never reach a
+     * page directly; they go through the heap inbox. So there is no per-page
+     * atomic free list here at all. */
+    /* Owner-thread free: push to local_free, no atomics. */
+    *(void**)ptr = pg->local_free;
+    pg->local_free = ptr;
+    pg->used--;
 
-        if (pg->flags == JET_PG_ACTIVE) {
-            /* Active page: block goes straight back via local_free; the next
-             * alloc miss reclaims it. Nothing to relink. Do NOT retire even if
-             * used==0 — it stays the active page. */
-            return;
-        }
-        if (JET_UNLIKELY(pg->used == 0)) {
-            /* Page fully empty and not active. Do NOT hand it straight back to
-             * the central pool: a slow cross-thread freer may still hold this
-             * pointer and be about to CAS onto pg->thread_free. Defer the real
-             * free to the epoch reclaimer, which only repurposes the page once
-             * every thread has passed a quiescent state (no stale pointer can
-             * survive). Unlink from our partial list first — that's purely
-             * owner-local state, safe to touch now. */
-            if (pg->flags == JET_PG_PARTIAL) partial_unlink(h, pg);
-            jet_epoch_retire(pg);
-            return;
-        }
-        if (pg->flags == JET_PG_FULL) {
-            /* Was full, now has a free block again — make it discoverable. */
-            partial_push(h, pg);
-        }
-        /* PARTIAL and still non-empty: already discoverable, nothing to do. */
-    } else {
-        /* Cross-thread free: atomic Treiber push onto the owner's thread_free. */
-        void* head = atomic_load_explicit(&pg->thread_free, memory_order_relaxed);
-        do {
-            *(void**)ptr = head;
-        } while (!atomic_compare_exchange_weak_explicit(
-            &pg->thread_free, &head, ptr, memory_order_release,
-            memory_order_relaxed));
+    if (pg->flags == JET_PG_ACTIVE) {
+        /* Active page: block goes straight back via local_free; the next
+         * alloc miss reclaims it. Nothing to relink. Do NOT retire even if
+         * used==0 — it stays the active page. */
+        return;
     }
+    if (JET_UNLIKELY(pg->used == 0)) {
+        /* Page fully empty and not active. Do NOT hand it straight back to
+         * the central pool: a slow cross-thread freer may still hold this
+         * pointer. Defer the real free to the epoch reclaimer, which only
+         * repurposes the page once every thread has passed a quiescent state
+         * (no stale pointer can survive). Unlink from our partial list first
+         * — that's purely owner-local state, safe to touch now. */
+        if (pg->flags == JET_PG_PARTIAL) partial_unlink(h, pg);
+        jet_epoch_retire(pg);
+        return;
+    }
+    if (pg->flags == JET_PG_FULL) {
+        /* Was full, now has a free block again — make it discoverable. */
+        partial_push(h, pg);
+    }
+    /* PARTIAL and still non-empty: already discoverable, nothing to do. */
 }
 
 /* Flush surplus fast-bin blocks for class `cls` back to their owning pages.

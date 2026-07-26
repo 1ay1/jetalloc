@@ -133,6 +133,22 @@ benchmark is unchanged. **TSan-verified race-free** across 18M cross-thread
 frees; the same TSan pass also closed a pre-existing lazy size-map init race
 (now a library constructor).
 
+### 4c. Per-page bitmap remote free — evaluated, deliberately NOT shipped
+**Source:** mimalloc's early per-page free design. The idea: a remote free sets
+one bit (`fetch_or`) at the block's slot index in a per-page bitmap; the owner
+reclaims by scanning dense words instead of pointer-chasing a Treiber chain.
+This solves the *same* problem — avoid a per-object atomic + a cache-miss walk
+of a per-page remote list — that jetalloc's batched message passing (4/4b)
+ALREADY solves, and more thoroughly: the common cross-thread free does **zero**
+atomics (pure local buffering) and the owner drains its whole inbox in one
+atomic-exchange, versus one `fetch_or` per free plus a bitmap scan. Measuring
+confirmed the per-page cross-thread list is now DEAD CODE (0 hits across 12M+
+cross-thread frees), so adding a bitmap would be a regression on live code and
+dead weight otherwise. Instead we DELETED the legacy per-page `thread_free`
+Treiber stack entirely — shrinking the page header by a whole `_Alignas(64)`
+cache line (denser TLB/cache, higher usable-byte ratio) and simplifying the
+free path. Bitmap goal achieved by a strictly better mechanism.
+
 ### 5. Sized-class → index by one multiply-shift, no table
 **Source:** tcmalloc/mimalloc size-class math. jetalloc uses a 2 KiB lookup
 table. The faster trick used in production: for size `n`, the class is derived by

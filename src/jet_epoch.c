@@ -3,12 +3,12 @@
  * SPDX-License-Identifier: MIT
  *
  * THE HAZARD. A cross-thread free reads pg->owner, decides the page belongs to
- * another heap, then CASes the block onto pg->thread_free. In between, the
+ * another heap, then routes the block to that owner's inbox. In between, the
  * owner may empty the page and call jet_central_retire_page(), which returns
  * the 64 KiB region to the central pool where raw_page() can immediately hand
  * it back to format_page() for a DIFFERENT size class. The slow freer then
- * clobbers a live, repurposed page (its thread_free, block_size and cls have
- * all changed). That is a genuine use-after-reformat race.
+ * reads a live, repurposed page (its owner, block_size and cls have all
+ * changed) and misroutes the block. That is a genuine use-after-reformat race.
  *
  * THE FIX (QSBR — the RCU / Crossbeam-epoch family). We never repurpose a
  * retired page while any thread might still hold a stale pointer to it:

@@ -50,17 +50,20 @@ int jet_size_class(size_t size);
 /*
  * One Page governs a single 64 KiB region serving ONE size class.
  *
- * Free-list sharding (the mimalloc trick): a page keeps TWO free lists.
- *   - local_free: blocks freed by the OWNER thread. Popped/pushed with no
- *     atomics on the hot path.
- *   - thread_free: blocks freed by OTHER threads, pushed atomically (MPSC
- *     lock-free stack). The owner drains it into local_free lazily when
- *     local_free empties, so the allocate/free fast paths never touch atomics.
+ * Free-list sharding (the mimalloc trick): a page keeps two owner-local free
+ * lists.
+ *   - local_free: blocks the owner freed but hasn't yet folded back into the
+ *     bump/reuse list. Popped/pushed with no atomics.
+ *   - alloc_free: the reuse list the fast path pops from; when it empties the
+ *     owner refills it from local_free. This split lets `free` be a branchless
+ *     push and `malloc` a branchless pop in the common same-thread case.
  *
- * `alloc_free` is the bump/reuse list the fast path pops from; when it empties
- * the owner refills it from local_free (then from thread_free). This split
- * lets `free` be a branchless push and `malloc` a branchless pop in the common
- * same-thread case.
+ * There is deliberately NO per-page cross-thread free list. Cross-thread frees
+ * never touch the page — they are batched into the OWNER HEAP's inbox
+ * (jet_heap.remote_in) via snmalloc-style message passing, so a page header is
+ * entirely owner-private and fits in a single cache line (no _Alignas(64)
+ * contended tail, no false sharing to design around). The owner folds inbox
+ * blocks back through the normal owner-free path when it drains.
  */
 typedef struct jet_page {
     /* ---- hot: touched on the alloc fast path (keep in the first cache line) */
@@ -77,15 +80,7 @@ typedef struct jet_page {
     uint32_t          capacity;       /* total blocks in the page              */
     uint16_t          cls;            /* size-class index                      */
     uint16_t          flags;          /* JET_PG_* state (see jet_core.c)       */
-    /* ---- cold, CONTENDED: written by *remote* threads via CAS. Kept on its
-     * own cache line so a cross-thread free's CAS does NOT invalidate the
-     * owner's hot line above (false-sharing fix — snmalloc RemoteAllocator). */
-    _Alignas(64) _Atomic(void*) thread_free;
 } jet_page;
-
-/* thread_free stores a (head_ptr | count) style tagged head is unnecessary;
- * we use a plain Treiber stack of block pointers. Each freed block's first
- * word holds the `next` link (blocks are >= 8 bytes, always). */
 
 /* ── Per-thread heap ──────────────────────────────────────────────────── */
 
@@ -179,8 +174,8 @@ void      jet_central_retire_page(jet_page* pg);          /* fully-empty page   
 /* ── Epoch-based (QSBR) safe page reclamation ─────────────────────────────
  * A retired page must not be REPURPOSED (re-minted for a different class or
  * unmapped) while another thread still holds a stale pointer to it and is about
- * to CAS onto pg->thread_free. Such a thread is inside a "read-side critical
- * section": between reading pg->owner and committing the cross-thread push.
+ * to route a block through it. Such a thread is inside a "read-side critical
+ * section": between reading pg->owner and committing the cross-thread route.
  *
  * We solve this with quiescent-state-based reclamation (QSBR), the same class
  * of algorithm as Linux RCU / the Crossbeam epoch crate: retire_page parks the
