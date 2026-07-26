@@ -142,11 +142,40 @@ int    jet_owns(const void*);              /* is this pointer ours? O(1)     */
 void   jet_get_stats(jet_stats*);          /* build with -DJET_STATS         */
 ```
 
+## Tuning
+
+Every knob has a sane default; the allocator needs no configuration.
+
+**Runtime env vars** (read once at library load, for experiments and atypical
+hardware):
+
+| Env var | Default | Effect |
+|---------|--------:|--------|
+| `JET_NUMA` | on if >1 node | First-touch NUMA-local span binding via `mbind`. Self-disables to a single branch on single-node machines; `JET_NUMA=0` forces off. |
+| `JET_PERCPU` | off | Opt-in rseq per-CPU cache (`src/jet_rseq.S`). A win only at very high core counts (64–128+); breaks even or regresses the single-thread fast path here. |
+| `JET_PLACE` | off | Research: address-routed, owner-oblivious cross-thread free. Correct but not faster than the batched engine on this box. |
+
+**Compile-time `#define`s** (in `src/jet_internal.h` / `src/jet_central.c`):
+
+| Macro | Default | Effect |
+|-------|--------:|--------|
+| `JET_TCACHE_BYTES` | 1 MiB | Per-class fast-bin byte budget; each bin caps at `bytes / class_size` clamped to [8, 1024]. 1 MiB is the measured knee. |
+| `JET_REMOTE_FLUSH` | 256 | Blocks buffered per target heap before a cross-thread free batch is posted (one atomic CAS per batch). |
+| `JET_SHARED_HOT` | 8 | Cross-thread-free score at which a size class is reclassified "shared-hot" and allowed a larger outgoing batch. |
+| `JET_SHARED_HOT_BYTES` | 2 MiB | Byte budget for a shared-hot class's outgoing batch (bounds stranded memory); measured optimum. |
+| `JET_COLORS` | 16 | Cache-coloring steps for consecutive same-class slabs (anti L1-set-conflict). Always on; zero hot-path cost. |
+
+See `docs/FAST.md` for the full instrumented rationale behind each — including
+the ones measured, documented, and deliberately left **off** by default.
+
 ## Status
 
-v0.1.0 — correct (100 % of the test suite, incl. an 8-thread cross-thread-free
-stress test) and faster than glibc on single-threaded workloads. The threaded
-path and a per-thread large-object cache are the next optimisation targets.
+Correct (100 % of the test suite — C, C++, and an 8-thread cross-thread-free
+stress; TSan + ASan/UBSan clean on the concurrent paths) and, through the
+identical `LD_PRELOAD` drop-in interface, **the fastest of the five allocators
+measured on three of four workloads** (small-fixed, mixed-size, threaded), and a
+clear #2 behind jemalloc on cross-thread producer/consumer — a gap that is
+structural and documented, not a missing optimisation (`docs/FAST.md`).
 
 Build with `-DJET_STATS=1` for live `jet_get_stats` counters (off by default so
 the hot path stays atomic-free), or `-DJET_DEBUG` for internal invariant checks.

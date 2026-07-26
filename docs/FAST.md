@@ -181,15 +181,16 @@ distinction. **SHIPPED.** Each heap keeps a saturating one-byte `shared_score`
 per size class, bumped whenever that class takes a cross-thread free. A class
 that proves producer/consumer-heavy (score ≥ `JET_SHARED_HOT`) is reclassified
 "shared-hot" and its outgoing remote bucket is allowed to accumulate a much
-larger batch — bounded by a BYTE budget (`JET_SHARED_HOT_BYTES`, 512 KiB), so
+larger batch — bounded by a BYTE budget (`JET_SHARED_HOT_BYTES`, 2 MiB), so
 small classes batch thousands deep while 32 KiB classes still flush after a
-handful and stranded memory stays bounded (≤ 512 KiB × 16 buckets per thread).
+handful and stranded memory stays bounded (≤ 2 MiB × 16 buckets per thread).
 More blocks per atomic post = fewer CASes on the owner's inbox; a rarely-shared
 class keeps a small fixed cap so a one-off cross-thread free never strands.
 The score lives on the (already cold) cross-thread free path — the owner fast
 path never reads it. Measured: **prod/cons 65–70 → 75–80 Mops/s** with the other
-three benchmarks unchanged; larger byte budgets push it to ~90 at a memory
-cost, so 512 KiB is the shipped default. TSan + ASan/UBSan clean.
+three benchmarks unchanged; the budget was swept 128K–16M and prod/cons peaks
+at 2 MiB then falls off (see negative results), so 2 MiB is the shipped default.
+TSan + ASan/UBSan clean.
 
 ### 4e. Place-based / temperature-aware free — research artifact (JET_PLACE=1)
 **The "stop tracking owners" idea, built and measured.** Instead of asking *who*
