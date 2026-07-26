@@ -23,13 +23,14 @@ against the fastest production allocators through the **identical** drop-in
 | small-fixed (32 B loop)            |    279   |  **292** |    256   |    250   |  228  |
 | **mixed-size (8 B–4 KiB)**          | **175** 🏆 |    151   |     61   |    102   |   18  |
 | threaded (8 threads, same-thread)  |    960   |  **1041**|    865   |    874   | 1173  |
-| producer/consumer (cross-thread)   |     66   |     22   |     74   |  **206** |   12  |
+| producer/consumer (cross-thread)   |    103   |     22   |     73   |  **203** |   12  |
 
 **Honest scorecard:** jetalloc **wins outright on mixed-size** (the most
 realistic churn workload — 1.7–2.9× the other slab allocators), is a close **#2 on
-small-fixed** (4% behind tcmalloc), competitive on threaded, and **loses
-cross-thread producer/consumer to jemalloc**, whose consumer-side lazy free
-caching we don't yet match. Reproduce it yourself: `bench/compare.sh`.
+small-fixed** (4% behind tcmalloc), competitive on threaded, and is **#2 on
+cross-thread producer/consumer** — decisively ahead of tcmalloc/mimalloc/glibc,
+with jemalloc still leading there (its consumer-side lazy free caching is a 2×
+edge we've now halved from 3.2×). Reproduce it yourself: `bench/compare.sh`.
 
 *(GCC/Clang, x86-64. Numbers vary by CPU; the harness runs the same binary under
 each allocator so the delta is purely the allocator.)*
