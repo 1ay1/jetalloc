@@ -192,7 +192,18 @@ typedef struct jet_page {
  * bounded. A rarely-shared class uses a small fixed count so a one-off
  * cross-thread free can't strand a block. */
 #define JET_SHARED_HOT       8         /* score at which a class is shared-hot */
-#define JET_SHARED_HOT_BYTES (512u*1024u) /* per-bucket byte budget, shared-hot */
+#define JET_SHARED_HOT_BYTES (2048u*1024u) /* per-bucket byte budget, shared-hot.
+                                 * Swept 256K/512K/1M/2M/4M/8M on the prod/cons
+                                 * bench: 102 / 122 / 129 / ~135 / 130 / 109
+                                 * Mops/s. Bigger batches mean fewer atomic posts
+                                 * per block, but the blocks sit in the freeing
+                                 * thread's outgoing cache instead of being
+                                 * reusable by their owner, so peak RSS grows:
+                                 * 23 MB @512K, 27 MB @2M, 33 MB @4M, 42 MB @8M.
+                                 * 2 MiB is the knee — most of the throughput for
+                                 * a bounded ~18% memory cost; past 4 MiB the
+                                 * owner starves waiting for memory and it is a
+                                 * NET LOSS on both axes. */
 #define JET_SHARED_COLD      24        /* per-bucket flush count, rarely-shared */
 
 /* ── Place-based / temperature-aware free (experimental, JET_PLACE=1) ──────
