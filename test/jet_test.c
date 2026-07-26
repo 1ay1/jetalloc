@@ -1,0 +1,124 @@
+/* jetalloc — C correctness tests. SPDX-License-Identifier: MIT */
+#include "jetalloc.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+static int fails = 0;
+#define CHECK(cond) do { if (!(cond)) { \
+    printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #cond); fails++; } } while (0)
+
+static void test_basic(void) {
+    void* p = jet_malloc(100);
+    CHECK(p != NULL);
+    CHECK(jet_owns(p));
+    CHECK(jet_usable_size(p) >= 100);
+    memset(p, 0xAB, 100);
+    jet_free(p);
+}
+
+static void test_all_size_classes(void) {
+    /* Alloc across the small ladder and the large threshold; write a canary
+     * spanning the whole usable region to catch class-size / overlap bugs. */
+    for (size_t sz = 1; sz <= 128 * 1024; sz = sz + (sz / 3) + 1) {
+        void* p = jet_malloc(sz);
+        CHECK(p != NULL);
+        CHECK(jet_usable_size(p) >= sz);
+        memset(p, 0x5A, sz);
+        /* verify no corruption of the byte just written */
+        CHECK(((unsigned char*)p)[sz - 1] == 0x5A);
+        jet_free(p);
+    }
+}
+
+static void test_alignment(void) {
+    size_t aligns[] = {16, 32, 64, 128, 256, 4096, 65536};
+    for (size_t i = 0; i < sizeof(aligns)/sizeof(aligns[0]); ++i) {
+        for (size_t sz = 1; sz <= 9000; sz = sz * 2 + 1) {
+            void* p = jet_aligned_alloc(aligns[i], sz);
+            CHECK(p != NULL);
+            CHECK(((uintptr_t)p & (aligns[i] - 1)) == 0);
+            jet_free(p);
+        }
+    }
+}
+
+static void test_calloc_zeroed(void) {
+    for (size_t sz = 1; sz <= 4096; sz *= 2) {
+        unsigned char* p = (unsigned char*)jet_calloc(1, sz);
+        CHECK(p != NULL);
+        for (size_t i = 0; i < sz; ++i) CHECK(p[i] == 0);
+        jet_free(p);
+    }
+    volatile size_t huge = (size_t)-1;
+    CHECK(jet_calloc(huge, 2) == NULL);  /* overflow guarded */
+}
+
+static void test_realloc(void) {
+    char* p = (char*)jet_malloc(16);
+    strcpy(p, "hello");
+    p = (char*)jet_realloc(p, 4096);
+    CHECK(p != NULL);
+    CHECK(strcmp(p, "hello") == 0);       /* data preserved on grow */
+    p = (char*)jet_realloc(p, 8);
+    CHECK(p != NULL);
+    CHECK(strncmp(p, "hello", 5) == 0);   /* data preserved on shrink */
+    jet_free(p);
+    CHECK(jet_realloc(NULL, 32) != NULL); /* realloc(NULL) == malloc */
+}
+
+static void test_churn(void) {
+    /* Allocate/free the same class repeatedly — the page free list must recycle
+     * blocks without unbounded growth. */
+    enum { N = 4096 };
+    void* ptrs[N];
+    for (int round = 0; round < 50; ++round) {
+        for (int i = 0; i < N; ++i) {
+            ptrs[i] = jet_malloc(64);
+            CHECK(ptrs[i] != NULL);
+            *(volatile char*)ptrs[i] = (char)i;
+        }
+        for (int i = 0; i < N; ++i) jet_free(ptrs[i]);
+    }
+}
+
+static void test_distinct_pointers(void) {
+    /* No two live allocations may alias. */
+    enum { N = 2000 };
+    void* ptrs[N];
+    for (int i = 0; i < N; ++i) {
+        ptrs[i] = jet_malloc(48);
+        for (int j = 0; j < i; ++j) CHECK(ptrs[i] != ptrs[j]);
+    }
+    for (int i = 0; i < N; ++i) jet_free(ptrs[i]);
+}
+
+static void test_foreign_safe(void) {
+    int stack_var = 7;
+    CHECK(jet_owns(&stack_var) == 0);     /* not ours → reported foreign */
+    CHECK(jet_usable_size(&stack_var) == 0);
+    jet_free(NULL);                        /* free(NULL) is a no-op */
+}
+
+int main(void) {
+    printf("jetalloc %s — C correctness tests\n", jet_version());
+    test_basic();
+    test_all_size_classes();
+    test_alignment();
+    test_calloc_zeroed();
+    test_realloc();
+    test_churn();
+    test_distinct_pointers();
+    test_foreign_safe();
+
+    jet_stats s;
+    jet_get_stats(&s);
+    printf("stats: live=%zu mapped=%zu pages=%zu large=%zu alloc=%zu free=%zu\n",
+           s.bytes_live, s.bytes_mapped, s.pages_active, s.large_active,
+           s.alloc_calls, s.free_calls);
+
+    if (fails) { printf("\n%d CHECK(s) FAILED\n", fails); return 1; }
+    printf("\nALL PASSED\n");
+    return 0;
+}

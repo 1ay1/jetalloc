@@ -1,0 +1,111 @@
+/*
+ * jetalloc — central span pool.
+ * SPDX-License-Identifier: MIT
+ *
+ * Carves 64 KiB slab pages out of 4 MiB OS spans and formats them for a size
+ * class. Locked, but touched only when a thread cache runs dry, so a single
+ * spinlock is cheap. Fully-empty pages are recycled here for any class.
+ */
+#include "jet_internal.h"
+#include <string.h>
+
+/* A minimal spinlock — the central pool is a cold path. */
+typedef struct { _Atomic(int) v; } jet_spin;
+static jet_spin central_lock = {0};
+
+static inline void spin_lock(jet_spin* s) {
+    for (;;) {
+        if (!atomic_exchange_explicit(&s->v, 1, memory_order_acquire)) return;
+        while (atomic_load_explicit(&s->v, memory_order_relaxed)) {
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#elif defined(__aarch64__)
+            __asm__ __volatile__("yield");
+#endif
+        }
+    }
+}
+static inline void spin_unlock(jet_spin* s) {
+    atomic_store_explicit(&s->v, 0, memory_order_release);
+}
+
+/* Free list of recycled empty pages, and the current bump cursor into the
+ * most-recently mapped span. */
+static jet_page* free_pages   = NULL;
+static uint8_t*  span_cursor  = NULL;
+static uint8_t*  span_end     = NULL;
+
+/* Pull one 64 KiB region: reuse a retired page, else bump within the current
+ * span, else map a fresh span. Caller holds central_lock. */
+static jet_page* raw_page(void) {
+    if (free_pages) {
+        jet_page* pg = free_pages;
+        free_pages = pg->next;
+        return pg;
+    }
+    if (span_cursor + JET_PAGE_SIZE > span_end) {
+        uint8_t* span = (uint8_t*)jet_os_map_aligned(JET_SPAN_SIZE,
+                                                     JET_PAGE_SIZE);
+        if (!span) return NULL;
+        span_cursor = span;
+        span_end    = span + JET_SPAN_SIZE;
+    }
+    jet_page* pg = (jet_page*)span_cursor;
+    span_cursor += JET_PAGE_SIZE;
+    return pg;
+}
+
+/* Format a raw region into a slab of `cls`-sized blocks, building the initial
+ * free list. Blocks live immediately after the header, aligned to JET_MIN_ALIGN. */
+static void format_page(jet_page* pg, jet_heap* h, int cls) {
+    uint32_t bs = jet_class_size[cls];
+
+    uintptr_t base = (uintptr_t)pg;
+    uintptr_t data = (base + sizeof(jet_page) + (JET_MIN_ALIGN - 1))
+                     & ~((uintptr_t)JET_MIN_ALIGN - 1);
+    uintptr_t top  = base + JET_PAGE_SIZE;
+    uint32_t cap   = (uint32_t)((top - data) / bs);
+
+    /* Thread the free list through the blocks: each block's first word points
+     * at the next. Build it forward so the first pop returns the lowest
+     * address (nicer prefetch behaviour). */
+    void* head = NULL;
+    void** link = &head;
+    uintptr_t b = data;
+    for (uint32_t i = 0; i < cap; ++i) {
+        *link = (void*)b;
+        link = (void**)b;
+        b += bs;
+    }
+    *link = NULL;
+
+    pg->next        = NULL;
+    pg->prev        = NULL;
+    pg->alloc_free  = head;
+    pg->local_free  = NULL;
+    atomic_store_explicit(&pg->thread_free, NULL, memory_order_relaxed);
+    pg->owner       = h;
+    pg->block_size  = bs;
+    pg->capacity    = cap;
+    pg->used        = 0;
+    pg->cls         = (uint16_t)cls;
+    pg->flags       = 0;
+}
+
+jet_page* jet_central_fresh_page(jet_heap* h, int cls) {
+    spin_lock(&central_lock);
+    jet_page* pg = raw_page();
+    spin_unlock(&central_lock);
+    if (!pg) return NULL;
+    format_page(pg, h, cls);
+    atomic_fetch_add_explicit(&jet_stat_pages, 1, memory_order_relaxed);
+    return pg;
+}
+
+void jet_central_retire_page(jet_page* pg) {
+    spin_lock(&central_lock);
+    pg->next = free_pages;
+    free_pages = pg;
+    spin_unlock(&central_lock);
+    atomic_fetch_sub_explicit(&jet_stat_pages, 1, memory_order_relaxed);
+}
