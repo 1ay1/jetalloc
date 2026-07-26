@@ -95,14 +95,19 @@ static jet_epoch_rec* epoch_rec(void) {
 void jet_epoch_register(jet_heap* h) { (void)h; (void)epoch_rec(); }
 
 void jet_epoch_enter(void) {
-    jet_epoch_rec* r = epoch_rec();
-    if (!r) return;                       /* OOM: degrade to no protection      */
+    /* Inline the common case: this thread's epoch record already exists, so
+     * jet_epoch_enter is a bare TLS load + one LOCK XCHG — no call. Only the
+     * first cross-thread free on a thread bootstraps the record. */
+    jet_epoch_rec* r = tls_rec;
+    if (JET_UNLIKELY(r == NULL)) {
+        r = epoch_rec();
+        if (!r) return;                   /* OOM: degrade to no protection      */
+    }
     uint64_t g = atomic_load_explicit(&g_epoch, memory_order_acquire);
     /* Publish the pin AND get the StoreLoad barrier in ONE instruction: a
      * seq_cst exchange compiles to a single LOCK XCHG on x86, which both
      * publishes r->local and prevents the subsequent load of pg->owner from
-     * being reordered ahead of the pin. This replaces the old store +
-     * standalone mfence (two barriers) on the hot cross-thread free path. */
+     * being reordered ahead of the pin. */
     (void)atomic_exchange_explicit(&r->local, g, memory_order_seq_cst);
 }
 
