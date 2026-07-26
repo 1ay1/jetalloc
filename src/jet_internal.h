@@ -435,7 +435,12 @@ static JET_ALWAYS_INLINE int jet_free_inline(void* ptr) {
 #endif
     jet_page* pg = jet_page_of(ptr);
     jet_heap* h = jet_tls_heap;
-    if (JET_LIKELY(h != NULL && pg->owner == h)) {
+    /* No `h != NULL` test needed: pg->owner is ALWAYS a real heap for a live
+     * slab page, so if this thread has no heap yet (h == NULL) the owner
+     * comparison below simply fails and we fall to the full path — which is
+     * exactly what an explicit NULL check would have done. Saves a test+branch
+     * on every single free. */
+    if (JET_LIKELY(pg->owner == h)) {
         unsigned cls = pg->cls;
         *(void**)ptr = h->tcache[cls];
         h->tcache[cls] = ptr;
