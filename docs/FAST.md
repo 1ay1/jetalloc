@@ -14,6 +14,32 @@ replayed*.** Everything below is a variation on those two ideas.
 
 ## Tier S — the ones that actually break the speed ceiling
 
+### 0. initial-exec TLS + inlined fast path ✅ (the biggest single win, all rows)
+**Source:** the ELF TLS access-model literature; every high-perf allocator
+compiles its thread-locals `initial-exec`. This was jetalloc's single largest
+speedup and it touched EVERY allocation. The thread-heap pointer is a
+`_Thread_local`; in the default *global-dynamic* TLS model a shared library
+reads it via a `__tls_get_addr()` **function call on every malloc and every
+free**. Compiling the allocator with `-ftls-model=initial-exec` turns that into
+a single `mov %fs:(reg), reg` — a direct segment-relative load, no call, no
+frame. Valid because our thread-locals live in the allocator image itself
+(static link or `LD_PRELOAD`), never a late `dlopen`. Paired with hoisting the
+size→class lookup and the thread-heap TLS load *inline* into `jet_malloc` /
+`jet_free` (the hot bin hit is now a bare `%fs` load + a pop, zero calls),
+measured on a 12-core Zen box vs the prior commit:
+
+| workload      | before | after | vs glibc |
+|---------------|-------:|------:|---------:|
+| small-fixed   |  ~265  | ~290  |  1.26×   |
+| mixed-size    |  ~145  | ~183  | 10.5×    |
+| threaded 8T   | ~840–930 | ~1120–1200 | ~parity (was 0.85×) |
+| prod/cons     |  ~70   | ~85   |  6.8×    |
+
+The threaded row went from 0.85× glibc to parity purely from removing the
+per-op `__tls_get_addr` call. Lesson: before chasing exotic cross-thread
+algorithms, make sure the *fast path has no hidden function call* — the TLS
+model is the classic trap.
+
 ### 1. Restartable sequences (rseq): atomicless *per-CPU* caching  ⭐ the big one
 **Source:** tcmalloc `docs/rseq.md`. This is *the* reason tcmalloc's per-CPU
 mode is the fastest general allocator on Linux.

@@ -303,10 +303,26 @@ void* jet_malloc(size_t size) {
     JET_STAT_ADD(jet_stat_alloc_calls, 1);
     if (JET_UNLIKELY(size > JET_LARGE_THRESHOLD))
         return jet_large_alloc(size, JET_MIN_ALIGN);
-    int cls = jet_size_class(size);
+    if (JET_UNLIKELY(size == 0)) size = 1;
+    int cls = jet_size_class_fast(size);
     JET_STAT_ADD(jet_stat_live, jet_class_size[cls]);
 
-    jet_heap* h = jet_thread_heap();
+    /* Inline the common thread-heap hit: a bare TLS load, no call. Only the
+     * first allocation on a thread misses and falls into heap_create. */
+    jet_heap* h = tls_heap;
+    if (JET_LIKELY(h != NULL)) {
+        if (JET_LIKELY(!jet_percpu_on)) {
+            void* b = h->tcache[cls];
+            if (JET_LIKELY(b != NULL)) {
+                h->tcache[cls] = *(void**)b;
+                h->tcount[cls]--;
+                return b;
+            }
+            return tcache_refill(h, cls);
+        }
+    } else {
+        h = jet_thread_heap();
+    }
     /* Per-CPU (rseq) fast path (opt-in via JET_PERCPU): pop from the current
      * CPU's slab with no atomics. Off by default — one predicted branch. */
     if (JET_UNLIKELY(jet_percpu_on)) {
@@ -506,12 +522,13 @@ void jet_free(void* ptr) {
         if (jet_percpu_push((int)pg->cls, ptr)) return;
     }
 
-    jet_heap* h = jet_thread_heap();
-    if (JET_LIKELY(pg->owner == h)) {
+    jet_heap* h = tls_heap;
+    if (JET_LIKELY(h != NULL) && JET_LIKELY(pg->owner == h)) {
         /* Owner-thread free: push onto the per-class fast bin. No page-header
          * bookkeeping, no flag machine — just two stores. No epoch pin: our
          * own page can't be retired-and-repurposed while WE are freeing into
-         * it (only the owner retires, and that's us). */
+         * it (only the owner retires, and that's us). A bare TLS load (no call)
+         * thanks to initial-exec; only the first free on a thread misses. */
         unsigned cls = pg->cls;
         *(void**)ptr = h->tcache[cls];
         h->tcache[cls] = ptr;
@@ -519,6 +536,7 @@ void jet_free(void* ptr) {
             tcache_flush(h, cls);
         return;
     }
+    if (JET_UNLIKELY(h == NULL)) h = jet_thread_heap();
     /* Cross-thread free. THIS is the hazardous path: the page could be retired
      * and repurposed by its owner while we route the block. Pin the epoch so
      * any concurrent retire is deferred until we leave, then re-read the owner

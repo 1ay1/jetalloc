@@ -13,6 +13,17 @@
 
 #include "jetalloc.h"
 
+/* ── Branch / inline hints (defined early: used by inline helpers below) ── */
+#if defined(__GNUC__) || defined(__clang__)
+#  define JET_LIKELY(x)   __builtin_expect(!!(x), 1)
+#  define JET_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#  define JET_ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#  define JET_LIKELY(x)   (x)
+#  define JET_UNLIKELY(x) (x)
+#  define JET_ALWAYS_INLINE inline
+#endif
+
 /* ── Tunables ─────────────────────────────────────────────────────────── */
 
 /* Every slab page is exactly this size and this-aligned. A block's owning
@@ -42,8 +53,21 @@
 extern const uint32_t jet_class_size[JET_NUM_CLASSES];
 
 /* Map a (small) request size to its class index in O(1). Callers must have
- * already checked size <= JET_LARGE_THRESHOLD. */
+ * already checked size <= JET_LARGE_THRESHOLD. Kept as an extern for ABI, but
+ * the hot path uses the inline form below so it fuses into jet_malloc. */
 int jet_size_class(size_t size);
+
+/* The flat size→class table (2 KiB, built once by a constructor in jet_size.c).
+ * Exposed so the fast path can inline the lookup with zero call overhead. */
+#define JET_SIZE_MAP_SLOTS (JET_LARGE_THRESHOLD / 16 + 1)
+extern uint8_t jet_class_map[JET_SIZE_MAP_SLOTS];
+
+/* Inline size→class: one shift + one table load, no call, no branch on the map
+ * (the table is always built by the time any allocation happens). `size` must
+ * be in [1, JET_LARGE_THRESHOLD]. */
+static JET_ALWAYS_INLINE int jet_size_class_fast(size_t size) {
+    return jet_class_map[(size - 1) >> 4];
+}
 
 /* ── Page (slab) header ───────────────────────────────────────────────── */
 
@@ -295,17 +319,6 @@ extern _Atomic(size_t) jet_stat_pages;
 extern _Atomic(size_t) jet_stat_large;
 extern _Atomic(size_t) jet_stat_alloc_calls;
 extern _Atomic(size_t) jet_stat_free_calls;
-
-/* ── Branch hints ─────────────────────────────────────────────────────── */
-#if defined(__GNUC__) || defined(__clang__)
-#  define JET_LIKELY(x)   __builtin_expect(!!(x), 1)
-#  define JET_UNLIKELY(x) __builtin_expect(!!(x), 0)
-#  define JET_ALWAYS_INLINE inline __attribute__((always_inline))
-#else
-#  define JET_LIKELY(x)   (x)
-#  define JET_UNLIKELY(x) (x)
-#  define JET_ALWAYS_INLINE inline
-#endif
 
 /* Per-operation statistics are OFF by default: 6 atomic RMWs per alloc/free
  * would dominate the hot path. Build with -DJET_STATS=1 to enable jet_get_stats

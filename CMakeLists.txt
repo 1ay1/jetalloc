@@ -18,6 +18,11 @@ if(NOT MSVC)
         $<$<CONFIG:Release>:-O3>
         $<$<CONFIG:Release>:-fno-plt>
         -fno-strict-aliasing
+        # initial-exec TLS: the thread-heap pointer becomes a direct %fs-relative
+        # load instead of a __tls_get_addr() CALL on every malloc/free. Valid
+        # because our thread-locals are defined IN the allocator image (whether
+        # linked statically or LD_PRELOAD'd), never dlopen'd late.
+        -ftls-model=initial-exec
         -fvisibility=hidden
         -Wall -Wextra)
 endif()

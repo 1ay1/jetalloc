@@ -24,7 +24,7 @@ const uint32_t jet_class_size[JET_NUM_CLASSES] = {
  * ladder on the hot path.
  */
 #define JET_MAP_SLOTS (JET_LARGE_THRESHOLD / 16 + 1)   /* 2049 */
-static uint8_t class_map[JET_MAP_SLOTS];
+uint8_t jet_class_map[JET_MAP_SLOTS];   /* exported: fast path inlines lookup */
 
 /* Fill the flat size→class table. Runs exactly once, before any thread can
  * call jet_size_class, via a library constructor — so there is no lazy-init
@@ -35,7 +35,7 @@ static void build_maps(void) {
     for (uint32_t s = 1; s <= JET_LARGE_THRESHOLD; ++s) {
         int c = 0;
         while (jet_class_size[c] < s) ++c;
-        class_map[(s - 1) >> 4] = (uint8_t)c;
+        jet_class_map[(s - 1) >> 4] = (uint8_t)c;
     }
 }
 
@@ -58,5 +58,5 @@ int jet_size_class(size_t size) {
     }
 #endif
     if (size == 0) size = 1;
-    return class_map[(size - 1) >> 4];
+    return jet_class_map[(size - 1) >> 4];
 }
