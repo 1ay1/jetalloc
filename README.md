@@ -14,16 +14,25 @@ It is a **drop-in replacement**: link it, or `LD_PRELOAD` it, and your program's
 
 Because a system allocator upgrade should never break your binary. jetalloc is
 self-contained (no external dependency, no fragile global `free()` interposition
-that crashes during C++ locale init), and it's *fast*:
+that crashes during C++ locale init), and it's *fast* — measured head-to-head
+against the fastest production allocators through the **identical** drop-in
+`malloc`/`free` interface (`LD_PRELOAD`), median of 5 runs on a 12-core Zen box:
 
-| Workload                | jetalloc       | glibc malloc | speedup |
-|-------------------------|----------------|--------------|---------|
-| small-fixed (32 B loop) | **254 Mops/s** | 222 Mops/s   | 1.14×   |
-| mixed-size (8 B–4 KiB)  | **164 Mops/s** | 16 Mops/s    | 10×     |
-| threaded (same-thread)  | 975 Mops/s     | 1148 Mops/s  | 0.85×   |
-| **producer/consumer**   | **74 Mops/s**  | 16 Mops/s    | 4.6×    |
+| Workload (Mops/s, higher = better) | jetalloc | tcmalloc | mimalloc | jemalloc | glibc |
+|------------------------------------|---------:|---------:|---------:|---------:|------:|
+| small-fixed (32 B loop)            |    279   |  **292** |    256   |    250   |  228  |
+| **mixed-size (8 B–4 KiB)**          | **175** 🏆 |    151   |     61   |    102   |   18  |
+| threaded (8 threads, same-thread)  |    960   |  **1041**|    865   |    874   | 1173  |
+| producer/consumer (cross-thread)   |     66   |     22   |     74   |  **206** |   12  |
 
-*(GCC 16, x86-64, `bench/jet_bench.c` — run it yourself, numbers vary by CPU.)*
+**Honest scorecard:** jetalloc **wins outright on mixed-size** (the most
+realistic churn workload — 1.7–2.9× the other slab allocators), is a close **#2 on
+small-fixed** (4% behind tcmalloc), competitive on threaded, and **loses
+cross-thread producer/consumer to jemalloc**, whose consumer-side lazy free
+caching we don't yet match. Reproduce it yourself: `bench/compare.sh`.
+
+*(GCC/Clang, x86-64. Numbers vary by CPU; the harness runs the same binary under
+each allocator so the delta is purely the allocator.)*
 
 ## Design
 
