@@ -205,6 +205,27 @@ static JET_ALWAYS_INLINE int page_has_room(jet_page* pg) {
     return pg->alloc_free != NULL || pg->bump < pg->bump_end;
 }
 
+/* Like page_pop, but reports whether the block is PRISTINE (came straight from
+ * the bump region — never handed out, so still zero from the fresh mmap) vs
+ * RECYCLED (from alloc_free — may hold stale bytes). Used by calloc to skip a
+ * needless memset on pristine blocks. */
+static JET_ALWAYS_INLINE void* page_pop_src(jet_page* pg, int* pristine) {
+    void* b = pg->alloc_free;
+    if (JET_LIKELY(b != NULL)) {
+        pg->alloc_free = *(void**)b;
+        pg->used++;
+        *pristine = 0;                 /* recycled: caller must zero           */
+        return b;
+    }
+    uint8_t* p = pg->bump;
+    pg->bump = p + pg->block_size;
+    pg->used++;
+    /* Pristine (already zero) only if this page's memory is never-written mmap.
+     * A RECYCLED page's bump region overlaps previously-written bytes. */
+    *pristine = pg->mem_fresh;
+    return p;
+}
+
 static void* alloc_small(jet_heap* h, int cls) {
     jet_page* pg = h->active[cls];
     if (JET_LIKELY(pg != NULL && page_has_room(pg)))
@@ -222,6 +243,24 @@ static void* alloc_small(jet_heap* h, int cls) {
     pg = obtain_page(h, cls);
     if (JET_UNLIKELY(!pg)) return NULL;
     return page_pop(pg);
+}
+
+/* calloc's provenance-aware allocation of one block, reporting *pristine.
+ * Mirrors alloc_small but uses page_pop_src so calloc can skip the memset when
+ * the block came from a page's bump region (already zero from mmap). */
+static void* alloc_small_src(jet_heap* h, int cls, int* pristine) {
+    jet_page* pg = h->active[cls];
+    if (JET_LIKELY(pg != NULL && page_has_room(pg)))
+        return page_pop_src(pg, pristine);
+    if (pg != NULL) {
+        if (refill_page(pg))
+            return page_pop_src(pg, pristine);
+        pg->flags = JET_PG_FULL;
+        h->active[cls] = NULL;
+    }
+    pg = obtain_page(h, cls);
+    if (JET_UNLIKELY(!pg)) return NULL;
+    return page_pop_src(pg, pristine);
 }
 
 /* Owner side of the place-based model: pop every page from our drain stack and
@@ -282,6 +321,39 @@ static void* tcache_refill(jet_heap* h, int cls) {
     /* Then greedily pull more from the now-active page straight into the bin,
      * without re-entering alloc_small per block. Cap the batch so a single
      * malloc can't front-load an unbounded amount of work. */
+    jet_page* pg = h->active[cls];
+    if (JET_LIKELY(pg != NULL)) {
+        uint32_t want = JET_TCACHE_MAX / 2;
+        void* head = h->tcache[cls];
+        uint32_t got = 0;
+        while (got < want && page_has_room(pg)) {
+            void* b = page_pop(pg);
+            *(void**)b = head;
+            head = b;
+            ++got;
+        }
+        h->tcache[cls] = head;
+        h->tcount[cls] += got;
+    }
+    return first;
+}
+
+/* calloc's slow path: same prep + batch fill as tcache_refill, but returns the
+ * first block's provenance so calloc can elide the memset for a pristine (bump)
+ * block. The batch stuffed into the tcache is left untouched — those blocks go
+ * through the normal recycled→zero path on a later calloc, which is correct
+ * (only a missed optimisation, never stale data). */
+static void* calloc_refill(jet_heap* h, int cls, int* pristine) {
+    jet_epoch_quiesce();
+    if (JET_UNLIKELY(atomic_load_explicit(&h->remote_in, memory_order_relaxed)))
+        remote_drain(h);
+    if (JET_UNLIKELY(jet_place_on &&
+                     atomic_load_explicit(&h->drain_pages, memory_order_relaxed)))
+        place_drain_pages(h);
+
+    void* first = alloc_small_src(h, cls, pristine);
+    if (JET_UNLIKELY(!first)) return NULL;
+
     jet_page* pg = h->active[cls];
     if (JET_LIKELY(pg != NULL)) {
         uint32_t want = JET_TCACHE_MAX / 2;
@@ -616,12 +688,44 @@ void jet_free_sized(void* ptr, size_t size) {
 void* jet_calloc(size_t count, size_t size) {
     size_t total;
     if (__builtin_mul_overflow(count, size, &total)) return NULL;
+    if (JET_UNLIKELY(total > JET_LARGE_THRESHOLD)) {
+        /* Large allocs come straight from mmap, which is already zero-filled. */
+        return jet_large_alloc(total, JET_MIN_ALIGN);
+    }
+    if (JET_UNLIKELY(total == 0)) total = 1;
+    int cls = jet_size_class_fast(total);
+    JET_STAT_ADD(jet_stat_alloc_calls, 1);
+    JET_STAT_ADD(jet_stat_live, jet_class_size[cls]);
+
+    /* calloc zero-elision (#14): a block taken from a page's BUMP region has
+     * never been handed out before, so it is still zero from the fresh mmap —
+     * memset is pure waste. Only RECYCLED blocks (tcache / alloc_free / a
+     * remote free) may hold stale bytes and need clearing. We take the slow
+     * path (which knows the block's provenance) and zero only when necessary.
+     * The per-CPU path can't report provenance, so with JET_PERCPU on we fall
+     * back to always-zero for correctness. */
+    jet_heap* h = tls_heap;
+    if (JET_LIKELY(h != NULL && !jet_percpu_on)) {
+        /* tcache blocks are recycled → must zero. */
+        void* b = h->tcache[cls];
+        if (b != NULL) {
+            h->tcache[cls] = *(void**)b;
+            h->tcount[cls]--;
+            memset(b, 0, jet_class_size[cls]);
+            return b;
+        }
+        /* Bin empty: refill, then the returned block may be pristine (bump) or
+         * recycled. calloc_refill reports which so we skip the memset when we
+         * safely can. */
+        int pristine = 0;
+        void* first = calloc_refill(h, cls, &pristine);
+        if (JET_UNLIKELY(!first)) return NULL;
+        if (!pristine) memset(first, 0, jet_class_size[cls]);
+        return first;
+    }
+    /* Fallback (no heap yet, or per-CPU on): allocate then zero. */
     void* p = jet_malloc(total);
-    if (!p) return NULL;
-    /* Fresh OS pages are already zero; only slab-reused memory needs clearing.
-     * We conservatively zero small allocs (reused) and rely on mmap zero for
-     * large ones. */
-    if (total <= JET_LARGE_THRESHOLD) memset(p, 0, total);
+    if (p) memset(p, 0, jet_class_size[cls]);
     return p;
 }
 

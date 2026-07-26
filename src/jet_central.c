@@ -48,11 +48,14 @@ static uint8_t*  span_end     = NULL;
 #define JET_COLORS       16u                  /* distinct colors (1 KiB span)   */
 static _Atomic(uint32_t) color_next = 0;      /* rotating page color            */
 /* Pull one 64 KiB region: reuse a retired page, else bump within the current
- * span, else map a fresh span. Caller holds central_lock. */
-static jet_page* raw_page(void) {
+ * span, else map a fresh span. Caller holds central_lock. Sets *mem_fresh to 1
+ * only when the returned region is NEVER-WRITTEN OS memory (still zero from
+ * mmap) — recycled pages from free_pages hold stale bytes, so *mem_fresh=0. */
+static jet_page* raw_page(int* mem_fresh) {
     if (free_pages) {
         jet_page* pg = free_pages;
         free_pages = pg->next;
+        *mem_fresh = 0;                 /* recycled — may hold stale data        */
         return pg;
     }
     if (span_cursor + JET_PAGE_SIZE > span_end) {
@@ -64,6 +67,7 @@ static jet_page* raw_page(void) {
     }
     jet_page* pg = (jet_page*)span_cursor;
     span_cursor += JET_PAGE_SIZE;
+    *mem_fresh = 1;                     /* fresh mmap — guaranteed zero          */
     return pg;
 }
 
@@ -74,7 +78,7 @@ static jet_page* raw_page(void) {
  * touching memory only as it's actually handed out. Recycled blocks later
  * flow through alloc_free/local_free (owner-local; cross-thread frees go to the
  * owner heap's inbox, never the page). */
-static void format_page(jet_page* pg, jet_heap* h, int cls) {
+static void format_page(jet_page* pg, jet_heap* h, int cls, int mem_fresh) {
     uint32_t bs = jet_class_size[cls];
 
     /* Pick this page's color (rotating). Relaxed atomic — format_page runs
@@ -101,7 +105,7 @@ static void format_page(jet_page* pg, jet_heap* h, int cls) {
     pg->used        = 0;
     pg->cls         = (uint16_t)cls;
     pg->flags       = 0;
-    pg->flags2      = 0;
+    pg->mem_fresh   = (uint8_t)mem_fresh;
     atomic_store_explicit(&pg->temp, 0, memory_order_relaxed);
     atomic_store_explicit(&pg->place_head, NULL, memory_order_relaxed);
     atomic_store_explicit(&pg->on_drain, 0, memory_order_relaxed);
@@ -109,11 +113,12 @@ static void format_page(jet_page* pg, jet_heap* h, int cls) {
 }
 
 jet_page* jet_central_fresh_page(jet_heap* h, int cls) {
+    int mem_fresh = 0;
     spin_lock(&central_lock);
-    jet_page* pg = raw_page();
+    jet_page* pg = raw_page(&mem_fresh);
     spin_unlock(&central_lock);
     if (!pg) return NULL;
-    format_page(pg, h, cls);
+    format_page(pg, h, cls, mem_fresh);
     atomic_fetch_add_explicit(&jet_stat_pages, 1, memory_order_relaxed);
     return pg;
 }

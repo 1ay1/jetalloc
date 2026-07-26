@@ -111,7 +111,7 @@ typedef struct jet_page {
      * (cross-thread) frees seen; once it crosses JET_TEMP_WARM the page is WARM
      * and cross-thread frees push straight onto place_head below. HOT pages
      * (temp low) never touch an atomic. Cheap: one byte, on the warm line. */
-    uint8_t           flags2;         /* (reserved padding for alignment)      */
+    uint8_t           mem_fresh;      /* 1 = bump region is never-written mmap */
     /* `temp` is a saturating count of foreign (cross-thread) frees seen. It is
      * written from multiple threads on the cross-thread free path, so it is a
      * RELAXED atomic — a lost update only perturbs the heat estimate, never

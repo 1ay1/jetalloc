@@ -313,6 +313,20 @@ that." Reused-before-reclaim costs **zero** page faults, vs `MADV_DONTNEED`/unma
 which guarantees a fault + zero-fill on the next touch. This is the right fix for
 jetalloc's stub `jet_trim()`.
 
+### 14b. calloc zero-elision on pristine bump blocks ✅ (1.6× calloc)
+**Source:** the classic "mmap already zeroes" observation; jemalloc/tcmalloc
+both track slab zero-ness. **SHIPPED.** `calloc` used to `memset(0)` every small
+block unconditionally. But a block taken from a page's BUMP region on a
+never-written (fresh-mmap) page is *already zero* — the memset is pure waste. We
+track per-page `mem_fresh` (set true only for genuinely fresh span memory, false
+for recycled `free_pages`), and a provenance-reporting `page_pop_src` tells
+`calloc` whether the block is pristine (bump + fresh page → skip memset) or
+recycled (may hold stale bytes → must clear). **Measured: calloc(64) 57–60 vs
+glibc 36 Mops/s — 1.6×.** Correctness stress (dirty→free→calloc→verify-zero over
+fresh and recycled pages, ASan-clean) passes; the memory-freshness bit is exact,
+not heuristic, so calloc never returns non-zero memory. Large calloc already
+rode mmap's zero-fill.
+
 ### 14. Never write freed memory you're about to reuse
 snmalloc/mimalloc keep the freelist link in the object's *first word* (jetalloc
 does this), but the deeper trick is **don't `memset` on free and don't re-zero on
