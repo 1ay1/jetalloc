@@ -404,17 +404,24 @@ static JET_ALWAYS_INLINE jet_page* jet_page_of(const void* block) {
  * full jet_page + jet_heap types) so both jet_core.c and jet_override.c inline
  * the identical code. */
 extern _Thread_local jet_heap* jet_tls_heap;
+/* The initial value of jet_tls_heap on every thread: a shared, permanently
+ * ALL-ZERO heap. It exists so the malloc fast path needs no `h == NULL` test —
+ * an unbootstrapped thread simply finds bin[cls] == NULL and falls into
+ * jet_malloc_refill, which detects the sentinel and creates the real heap. That
+ * removes a test+branch from every allocation and lets the TLS load overlap the
+ * size-class computation. It is never written to (refill swaps in a real heap
+ * before any store), so threads sharing it is safe. */
+extern jet_heap jet_null_heap;
 void* jet_malloc_refill(jet_heap* h, int cls);      /* bin empty → refill+pop  */
 void  jet_tcache_flush_pub(jet_heap* h, unsigned cls); /* over-cap flush        */
 
 static JET_ALWAYS_INLINE void* jet_malloc_inline(size_t size) {
-    /* size==0 or > threshold, or per-CPU armed, or no heap yet → full entry. */
+    /* size==0 or > threshold, or per-CPU armed → full entry. */
     if (JET_UNLIKELY(size - 1 >= JET_LARGE_THRESHOLD)) return jet_malloc(size);
 #if !JET_STRIP_PERCPU
     if (JET_UNLIKELY(jet_percpu_on)) return jet_malloc(size);
 #endif
     jet_heap* h = jet_tls_heap;
-    if (JET_UNLIKELY(h == NULL)) return jet_malloc(size);
     int cls = jet_size_class_fast(size);
     void* b = h->tcache[cls];
     if (JET_LIKELY(b != NULL)) {
@@ -422,6 +429,8 @@ static JET_ALWAYS_INLINE void* jet_malloc_inline(size_t size) {
         h->tcount[cls]--;
         return b;
     }
+    /* Empty bin — or this thread is still on the zero sentinel, whose bins are
+     * all NULL. Either way refill handles it (and bootstraps if needed). */
     return jet_malloc_refill(h, cls);
 }
 

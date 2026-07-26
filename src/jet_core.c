@@ -25,7 +25,13 @@
 
 /* ── Thread heap registry ─────────────────────────────────────────────── */
 
-_Thread_local jet_heap* jet_tls_heap = NULL;
+/* The all-zero sentinel heap every thread starts on. Never written: the first
+ * allocation finds every bin empty, falls into jet_malloc_refill, which sees the
+ * sentinel and swaps in a real heap before touching anything. Letting threads
+ * share it is therefore safe, and it buys the malloc fast path a removed
+ * NULL-check (see jet_malloc_inline in jet_internal.h). */
+jet_heap jet_null_heap;
+_Thread_local jet_heap* jet_tls_heap = &jet_null_heap;
 #define tls_heap jet_tls_heap
 
 /* All heaps chained for teardown/trim. Guarded by a spinlock (cold). */
@@ -90,8 +96,13 @@ static jet_heap* heap_create(void) {
 
 jet_heap* jet_thread_heap(void) {
     jet_heap* h = tls_heap;
-    if (JET_LIKELY(h != NULL)) return h;
+    /* &jet_null_heap is the pre-bootstrap sentinel, not a usable heap. */
+    if (JET_LIKELY(h != &jet_null_heap)) return h;
     h = heap_create();
+    /* On OOM keep the sentinel installed rather than NULL, so every fast path
+     * that tests `!= &jet_null_heap` keeps routing to the slow path instead of
+     * dereferencing NULL. Callers still see NULL returned and propagate it. */
+    if (JET_UNLIKELY(h == NULL)) return NULL;
     tls_heap = h;
     return h;
 }
@@ -378,7 +389,7 @@ void* jet_malloc(size_t size) {
     /* Inline the common thread-heap hit: a bare TLS load, no call. Only the
      * first allocation on a thread misses and falls into heap_create. */
     jet_heap* h = tls_heap;
-    if (JET_LIKELY(h != NULL)) {
+    if (JET_LIKELY(h != &jet_null_heap)) {
         if (JET_LIKELY(!jet_percpu_on)) {
             void* b = h->tcache[cls];
             if (JET_LIKELY(b != NULL)) {
@@ -473,7 +484,16 @@ static void tcache_flush(jet_heap* h, unsigned cls) {
 
 /* Public wrappers so the inline drop-in fast paths (jet_internal.h, used by the
  * interposed malloc/free) reach the slow-path continuations across TU bounds. */
-void* jet_malloc_refill(jet_heap* h, int cls) { return tcache_refill(h, cls); }
+/* Public wrapper for the inline malloc fast path. `h` may be the all-zero
+ * sentinel heap (thread not yet bootstrapped) — detect that and create the real
+ * one first, which is exactly the old `h == NULL` slow path. */
+void* jet_malloc_refill(jet_heap* h, int cls) {
+    if (JET_UNLIKELY(h == &jet_null_heap)) {
+        h = jet_thread_heap();
+        if (JET_UNLIKELY(h == NULL)) return NULL;
+    }
+    return tcache_refill(h, cls);
+}
 void  jet_tcache_flush_pub(jet_heap* h, unsigned cls) { tcache_flush(h, cls); }
 
 /* ── Cross-thread free: batched message passing (snmalloc-style) ───────── */
@@ -596,7 +616,7 @@ void jet_free(void* ptr) {
     }
 
     jet_heap* h = tls_heap;
-    if (JET_LIKELY(h != NULL) && JET_LIKELY(pg->owner == h)) {
+    if (JET_LIKELY(h != &jet_null_heap) && JET_LIKELY(pg->owner == h)) {
         /* Owner-thread free: push onto the per-class fast bin. No page-header
          * bookkeeping, no flag machine — just two stores. No epoch pin: our
          * own page can't be retired-and-repurposed while WE are freeing into
@@ -609,7 +629,7 @@ void jet_free(void* ptr) {
             tcache_flush(h, cls);
         return;
     }
-    if (JET_UNLIKELY(h == NULL)) h = jet_thread_heap();
+    if (JET_UNLIKELY(h == &jet_null_heap)) h = jet_thread_heap();
     /* Cross-thread free. THIS is the hazardous path: the page could be retired
      * and repurposed by its owner while we route the block. Pin the epoch so
      * any concurrent retire is deferred until we leave, then re-read the owner
@@ -706,7 +726,7 @@ void* jet_calloc(size_t count, size_t size) {
      * The per-CPU path can't report provenance, so with JET_PERCPU on we fall
      * back to always-zero for correctness. */
     jet_heap* h = tls_heap;
-    if (JET_LIKELY(h != NULL && !jet_percpu_on)) {
+    if (JET_LIKELY(h != &jet_null_heap && !jet_percpu_on)) {
         /* tcache blocks are recycled → must zero. */
         void* b = h->tcache[cls];
         if (b != NULL) {
