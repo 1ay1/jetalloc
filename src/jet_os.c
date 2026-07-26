@@ -30,6 +30,13 @@ _Atomic(size_t) jet_stat_free_calls  = 0;
  * to per-span mmap and the slower header-sniff owns(). */
 #if !defined(_WIN32) && defined(__LP64__)
 #  define JET_ARENA_BYTES  ((size_t)64 * 1024 * 1024 * 1024)   /* 64 GiB VA     */
+/* The arena base, published for the INLINE single-compare ownership test in
+ * jet_internal.h. Sentinel for "no arena": UINTPTR_MAX, chosen so the unsigned
+ * wrap trick (p - base < JET_ARENA_BYTES) is false for every real pointer
+ * without needing a separate base!=0 branch. That turns free()'s ownership test
+ * into ONE load + sub + cmp-immediate instead of two global loads and two
+ * compares. */
+uintptr_t jet_arena_base_pub = UINTPTR_MAX;
 static _Atomic(uintptr_t) g_arena_base = 0;   /* 0 = arena disabled            */
 static uintptr_t          g_arena_end  = 0;   /* base + reserved (const once)  */
 static _Atomic(uintptr_t) g_arena_cur  = 0;   /* bump cursor (atomic)          */
@@ -47,6 +54,10 @@ static void arena_reserve(void) {
             memory_order_acq_rel, memory_order_acquire)) {
         g_arena_end = base + JET_ARENA_BYTES;
         atomic_store_explicit(&g_arena_cur, base, memory_order_release);
+        /* Publish LAST: until this store lands the inline test sees the
+         * UINTPTR_MAX sentinel and simply reports "not ours", which routes the
+         * pointer down the safe header-sniff path. Never a false positive. */
+        __atomic_store_n(&jet_arena_base_pub, base, __ATOMIC_RELEASE);
     } else {
         munmap(p, JET_ARENA_BYTES);                    /* lost the race         */
     }
@@ -75,11 +86,12 @@ static void* arena_carve(size_t bytes, size_t align) {
     }
 }
 
-/* Single-compare ownership test: is this a slab pointer we carved? Zero loads. */
+/* Single-compare ownership test: is this a slab pointer we carved? See the
+ * inline JET_ARENA_CONTAINS in jet_internal.h — this out-of-line form exists for
+ * the non-inlined callers and mirrors it exactly. */
 int jet_arena_contains(const void* ptr) {
-    uintptr_t base = atomic_load_explicit(&g_arena_base, memory_order_acquire);
-    uintptr_t p = (uintptr_t)ptr;
-    return base && p >= base && p < g_arena_end;
+    uintptr_t base = __atomic_load_n(&jet_arena_base_pub, __ATOMIC_ACQUIRE);
+    return (uintptr_t)ptr - base < JET_ARENA_BYTES;
 }
 
 /* 1 iff the arena is NOT active (reservation failed) — callers then fall back to
@@ -90,6 +102,7 @@ int jet_arena_disabled(void) {
     return atomic_load_explicit(&g_arena_base, memory_order_acquire) == 0;
 }
 #else
+uintptr_t jet_arena_base_pub = UINTPTR_MAX;
 int jet_arena_contains(const void* ptr) { (void)ptr; return 0; }
 int jet_arena_disabled(void) { return 1; }
 #endif

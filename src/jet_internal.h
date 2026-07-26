@@ -317,8 +317,19 @@ void* jet_os_map_span(size_t bytes, size_t align);  /* slab span (arena-backed) 
 void  jet_os_unmap(void* p, size_t bytes);
 
 /* Single-compare slab-ownership test: 1 iff ptr lies in the reserved arena.
- * Zero memory loads — this is what makes free()'s ownership check cheap. */
-int   jet_arena_contains(const void* ptr);
+ * ONE global load + sub + cmp-immediate — this is what makes free()'s ownership
+ * check cheap. The arena is a fixed 64 GiB reservation, so the two-sided range
+ * test collapses to one unsigned compare via wraparound:
+ *     (uintptr_t)ptr - base < JET_ARENA_BYTES
+ * When no arena is reserved, base is the UINTPTR_MAX sentinel, which makes the
+ * subtraction wrap to a huge value for every real pointer — so "disabled" needs
+ * no extra branch and can never produce a false positive. */
+#define JET_ARENA_SPAN  ((size_t)64 * 1024 * 1024 * 1024)   /* keep == JET_ARENA_BYTES */
+extern uintptr_t jet_arena_base_pub;
+static JET_ALWAYS_INLINE int jet_arena_contains_inline(const void* ptr) {
+    return (uintptr_t)ptr - jet_arena_base_pub < JET_ARENA_SPAN;
+}
+int   jet_arena_contains(const void* ptr);   /* out-of-line mirror             */
 int   jet_arena_disabled(void);            /* 1 iff arena reservation failed  */
 
 /* ── NUMA / topology-aware placement (jet_numa.c) ─────────────────────────
@@ -386,7 +397,7 @@ static JET_ALWAYS_INLINE void* jet_malloc_inline(size_t size) {
  * caller must take the full jet_free() path (cross-thread, large, or foreign). */
 static JET_ALWAYS_INLINE int jet_free_inline(void* ptr) {
     if (JET_UNLIKELY(ptr == NULL)) return 1;
-    if (JET_UNLIKELY(!jet_arena_contains(ptr))) return 0;  /* large/foreign      */
+    if (JET_UNLIKELY(!jet_arena_contains_inline(ptr))) return 0;  /* large/foreign */
     if (JET_UNLIKELY(jet_percpu_on)) return 0;
     jet_page* pg = jet_page_of(ptr);
     jet_heap* h = jet_tls_heap;
