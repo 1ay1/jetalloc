@@ -35,6 +35,18 @@ static jet_page* free_pages   = NULL;
 static uint8_t*  span_cursor  = NULL;
 static uint8_t*  span_end     = NULL;
 
+/* ── Cache coloring ───────────────────────────────────────────────────────
+ * Every page's block data would otherwise start at the SAME offset
+ * (sizeof(jet_page) rounded up), so block N of every page maps to the SAME L1
+ * cache set. Two hot objects at the same slot in different pages then conflict
+ * and evict each other. We rotate each page's data start by a per-page COLOR
+ * (a multiple of a cache line), spreading equivalent slots of consecutive pages
+ * across different sets — the page-coloring trick from OS VM, applied in
+ * user space. Cost: up to (COLORS-1)*LINE wasted bytes per page (<= ~1 KiB of
+ * a 64 KiB page), reclaimed as capacity shrinks by at most one block. */
+#define JET_COLOR_LINE   64u                  /* cache line                     */
+#define JET_COLORS       16u                  /* distinct colors (1 KiB span)   */
+static _Atomic(uint32_t) color_next = 0;      /* rotating page color            */
 /* Pull one 64 KiB region: reuse a retired page, else bump within the current
  * span, else map a fresh span. Caller holds central_lock. */
 static jet_page* raw_page(void) {
@@ -65,8 +77,14 @@ static jet_page* raw_page(void) {
 static void format_page(jet_page* pg, jet_heap* h, int cls) {
     uint32_t bs = jet_class_size[cls];
 
+    /* Pick this page's color (rotating). Relaxed atomic — format_page runs
+     * unlocked and a racy duplicate color is harmless (just a weaker spread). */
+    uint32_t color = atomic_fetch_add_explicit(
+        &color_next, 1, memory_order_relaxed) % JET_COLORS;
+    uintptr_t shift = (uintptr_t)color * JET_COLOR_LINE;
+
     uintptr_t base = (uintptr_t)pg;
-    uintptr_t data = (base + sizeof(jet_page) + (JET_MIN_ALIGN - 1))
+    uintptr_t data = (base + sizeof(jet_page) + shift + (JET_MIN_ALIGN - 1))
                      & ~((uintptr_t)JET_MIN_ALIGN - 1);
     uintptr_t top  = base + JET_PAGE_SIZE;
     uint32_t cap   = (uint32_t)((top - data) / bs);
