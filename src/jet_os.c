@@ -69,6 +69,14 @@ void* jet_os_map_aligned(size_t bytes, size_t align) {
     if (head) munmap((void*)base, head);
     if (tail) munmap((void*)(aligned + bytes), tail);
 
+#if defined(MADV_HUGEPAGE)
+    /* Ask the kernel to back this region with transparent huge pages when it
+     * can: fewer page faults, smaller page tables, far better TLB hit rate on
+     * the 2 MiB/4 MiB slab spans. Advisory — ignored if THP is off. */
+    if (bytes >= (2u << 20))
+        madvise((void*)aligned, bytes, MADV_HUGEPAGE);
+#endif
+
     atomic_fetch_add_explicit(&jet_stat_mapped, bytes, memory_order_relaxed);
     return (void*)aligned;
 #endif
