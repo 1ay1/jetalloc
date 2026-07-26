@@ -442,6 +442,47 @@ Things tried against this ceiling, all measured, all reverted:
 The one thing that DID help the row (and mixed, and small-fixed): the
 `jet_epoch_quiesce` lock-free empty-check (see below).
 
+### What jemalloc actually does — and why it costs 2.3× the memory
+
+A magazine-depot prototype (bulk block transfer: consumer fills a 64-pointer
+magazine, pushes it to a per-pair lock-free depot; producer pops a whole
+magazine and reuses those exact blocks) runs this same workload at **~550
+Mops/s** — far above jemalloc's 210 and jetalloc's 145. That is the mechanism
+class jemalloc is in: bulk transfer with **zero per-block page-header work**,
+and the producer re-issuing the very blocks the consumer returned.
+
+Measured directly (`VmHWM` via an LD_PRELOAD destructor probe on the isolated
+prod/cons harness):
+
+| allocator | prod/cons Mops/s | peak RSS |
+|-----------|-----------------:|---------:|
+| jetalloc  |            ~145  |   15 MB  |
+| jemalloc  |            ~185+ |   33 MB  |
+
+jemalloc buys its cross-thread throughput by **hoarding freed blocks in the
+freeing thread's cache** instead of returning them to the owner — 2.3× the
+RSS. That is a deliberate speed-for-memory trade, and it is exactly the trade
+jetalloc's owner-routing design does NOT make (which is why jetalloc wins
+mixed and threaded and uses half the memory).
+
+**The structural verdict.** Winning prod/cons requires bulk magazine transfer
+that re-issues consumer-freed blocks with no page bookkeeping. Every attempt to
+graft that onto jetalloc's page-based slabs was measured slower (see the three
+direct-to-bin variants below), because it starves the page-recycling machinery
+that the OTHER three workloads depend on. The 550 Mops/s prototype has NO page
+layer at all — reaching it would mean replacing jetalloc's core, trading away
+the small-fixed / mixed / threaded wins and doubling RSS. Not worth it for one
+synthetic row. Documented, decided, closed.
+
+### Direct-to-bin drain — three variants, all slower (do not re-try)
+- Bounded-by-cap, `pg->used--` per block: 145 -> 106 (pages retire wrong).
+- Bounded-by-cap, correct checked-out semantics (NO `used--`, blocks stay
+  logically allocated until bin overflow): passes all tests but 145 -> 114 —
+  pages never retire via drain, so the producer mints more cold fresh pages.
+- Deep-prefetch two-pass (materialise chain to array, prefetch 16 ahead, then
+  fold): 152 -> 137. The chain per drain is too short for the second pass to
+  pay for itself.
+
 ---
 
 ## Tier S+ shipped: lock-free `jet_epoch_quiesce` empty-check  ✅ (prod/cons +~7%)
