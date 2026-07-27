@@ -69,6 +69,16 @@ if(NOT MSVC)
         endif()
     endforeach()
     list(APPEND JET_CORE_FLAGS -Wall -Wextra $<$<CONFIG:Release>:-O3>)
+else()
+    # MSVC's <stdatomic.h> (used across jet_central/jet_epoch/jet_percpu for
+    # the lock-free counters) is gated behind an opt-in: without it the header
+    # hard-errors with C1189 '"C atomic support is not enabled"'. Enable the
+    # C11 atomics feature (VS 2022 17.5+) and pin C11 so the compiler actually
+    # honours _Atomic / <stdatomic.h>. Applies to the C TUs only — the C++
+    # override TU uses std::atomic and needs neither.
+    list(APPEND JET_CORE_FLAGS
+        $<$<COMPILE_LANGUAGE:C>:/experimental:c11atomics>
+        $<$<COMPILE_LANGUAGE:C>:/std:c11>)
 endif()
 
 # ── Core static library ──────────────────────────────────────────────────
