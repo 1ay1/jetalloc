@@ -162,6 +162,35 @@ static void test_foreign_safe(void) {
 
     /* A low, obviously-invalid pointer must also be safely disowned. */
     CHECK(jet_owns((void*)0x1234) == 0);
+
+    /* Page-aligned pointers are the large-alloc candidate path, where hdr_of()
+     * reads a header BEFORE the pointer. On a foreign or freed page-aligned
+     * pointer that read used to fault; the live-large registry must now answer
+     * "not ours" without dereferencing. */
+#if defined(__unix__) || defined(__APPLE__)
+    /* A fresh page-aligned mmap jetalloc never handed out. jetalloc's slab
+     * page granularity is 64 KiB; align to it so the pointer looks like a
+     * large-alloc candidate. */
+    const size_t JPAGE = 64u * 1024u;
+    void* pa = mmap(NULL, 3u * JPAGE, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (pa != MAP_FAILED) {
+        uintptr_t aligned = ((uintptr_t)pa + JPAGE - 1) & ~((uintptr_t)JPAGE - 1);
+        CHECK(jet_owns((void*)aligned) == 0);        /* must not crash        */
+        CHECK(jet_usable_size((void*)aligned) == 0);
+        munmap(pa, 3u * JPAGE);
+    }
+#endif
+
+    /* Large alloc: owns() after free must be safely false (not a SEGV reading
+     * the now-unmapped header), and a second free must be a safe no-op. */
+    void* big = jet_malloc(200000);
+    CHECK(big != NULL);
+    CHECK(jet_owns(big));
+    jet_free(big);
+    CHECK(jet_owns(big) == 0);      /* freed large: safe, reports not-ours     */
+    CHECK(jet_usable_size(big) == 0);
+    jet_free(big);                   /* double-free of large: safe no-op       */
 }
 
 int main(void) {

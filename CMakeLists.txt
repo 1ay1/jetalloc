@@ -146,6 +146,10 @@ if(JET_BUILD_TESTS)
     add_executable(jet_test_xthread test/jet_test_xthread.c)
     target_link_libraries(jet_test_xthread PRIVATE jetalloc Threads::Threads)
     add_test(NAME jet_test_xthread COMMAND jet_test_xthread)
+
+    add_executable(jet_test_large_mt test/jet_test_large_mt.c)
+    target_link_libraries(jet_test_large_mt PRIVATE jetalloc Threads::Threads)
+    add_test(NAME jet_test_large_mt COMMAND jet_test_large_mt)
 endif()
 
 # ── Benchmark ────────────────────────────────────────────────────────────
