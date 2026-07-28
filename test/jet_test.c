@@ -36,6 +36,7 @@ static void test_all_size_classes(void) {
 }
 
 static void test_alignment(void) {
+    /* Sub-page alignments over the small ladder. */
     size_t aligns[] = {16, 32, 64, 128, 256, 4096, 65536};
     for (size_t i = 0; i < sizeof(aligns)/sizeof(aligns[0]); ++i) {
         for (size_t sz = 1; sz <= 9000; sz = sz * 2 + 1) {
@@ -45,6 +46,29 @@ static void test_alignment(void) {
             jet_free(p);
         }
     }
+    /* OVER-page alignments (> 64 KiB) hit the large/direct-mmap path, which
+     * must over-map so the payload is truly `align`-aligned — not merely
+     * page-aligned. Regression guard for the aligned_alloc bug where any
+     * alignment > 64 KiB silently returned only page-aligned memory. Write a
+     * canary across the whole reported usable region to catch OOB too. */
+    size_t big_aligns[] = {131072, 262144, 524288, 1u<<20, 2u<<20, 4u<<20};
+    for (size_t i = 0; i < sizeof(big_aligns)/sizeof(big_aligns[0]); ++i) {
+        size_t a = big_aligns[i];
+        for (size_t sz = 1; sz <= 200000; sz = sz * 8 + 1) {
+            void* p = jet_aligned_alloc(a, sz);
+            CHECK(p != NULL);
+            CHECK(((uintptr_t)p & (a - 1)) == 0);   /* truly align-aligned  */
+            CHECK(jet_usable_size(p) >= sz);
+            memset(p, 0xDA, sz);                     /* full payload writable */
+            CHECK(((unsigned char*)p)[sz - 1] == 0xDA);
+            jet_free(p);
+        }
+    }
+    /* posix_memalign with a huge alignment. */
+    void* q = NULL;
+    CHECK(jet_posix_memalign(&q, 1u << 20, 5000) == 0);
+    CHECK(q != NULL && ((uintptr_t)q & ((1u << 20) - 1)) == 0);
+    jet_free(q);
 }
 
 static void test_calloc_zeroed(void) {

@@ -29,16 +29,33 @@ typedef struct jet_large_hdr {
 void* jet_large_alloc(size_t size, size_t align) {
     if (align < JET_PAGE_SIZE) align = JET_PAGE_SIZE;
 
-    /* Reserve header page + rounded payload. */
+    /* Payload must be `align`-aligned AND have room for the header immediately
+     * before it. The header is far smaller than a page, so one page (or, for
+     * over-page alignments, one full `align` step) of headroom is plenty.
+     *
+     * jet_os_map_aligned returns an `align`-aligned base, so:
+     *   - align == JET_PAGE_SIZE: the page after base is align-aligned and the
+     *     header fits in that page  -> payload = base + JET_PAGE_SIZE.
+     *   - align  > JET_PAGE_SIZE: base + JET_PAGE_SIZE is NOT align-aligned
+     *     (base%align==0 but JET_PAGE_SIZE%align!=0). The first align-aligned
+     *     address with header headroom is base + align  -> payload = base +
+     *     align. This is the over-map the header comment always promised; it
+     *     was previously unimplemented, so aligned_alloc / posix_memalign /
+     *     over-aligned operator new silently returned only page-aligned memory
+     *     for any alignment > 64 KiB (a C11/POSIX contract violation). */
+    size_t headroom = (align > JET_PAGE_SIZE) ? align : JET_PAGE_SIZE;
+
+    /* Reserve headroom + rounded payload. */
     size_t payload_rounded = (size + JET_PAGE_SIZE - 1) & ~((size_t)JET_PAGE_SIZE - 1);
-    size_t total = JET_PAGE_SIZE + payload_rounded;
+    size_t total = headroom + payload_rounded;
 
     void* base = jet_os_map_aligned(total, align);
     if (!base) return NULL;
 
-    /* Payload begins one page in — that keeps it `align`-aligned because base
-     * is `align`-aligned and align is a multiple of JET_PAGE_SIZE. */
-    uint8_t* payload = (uint8_t*)base + JET_PAGE_SIZE;
+    /* Payload begins `headroom` in — align-aligned because base is align-aligned
+     * and headroom is a multiple of align (== align for over-page alignments,
+     * == JET_PAGE_SIZE which divides align when align == JET_PAGE_SIZE). */
+    uint8_t* payload = (uint8_t*)base + headroom;
     jet_large_hdr* h = (jet_large_hdr*)(payload - sizeof(jet_large_hdr));
     h->magic    = JET_LARGE_MAGIC;
     h->total    = total;
@@ -78,8 +95,12 @@ int jet_large_free(void* ptr) {
 size_t jet_large_usable(const void* ptr) {
     jet_large_hdr* h = hdr_of(ptr);
     if (!h) return 0;
-    /* Usable = everything from payload start to end of the mapping. */
-    return h->total - JET_PAGE_SIZE;
+    /* Usable = everything from the payload start to the end of the mapping.
+     * The header offset (payload - map_base) is `headroom`, which is a full
+     * page for align<=page but `align` for over-page alignments — so derive it
+     * from the actual pointer rather than assuming one page. */
+    size_t offset = (size_t)((const uint8_t*)ptr - (const uint8_t*)h->map_base);
+    return h->total - offset;
 }
 
 int jet_large_owns(const void* ptr) {
