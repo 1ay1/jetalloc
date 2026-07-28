@@ -825,8 +825,14 @@ int jet_owns(const void* ptr) {
      * allocation of ours — validate via its header magic. */
     if (((uintptr_t)ptr & (JET_PAGE_SIZE - 1)) == 0)
         return jet_large_owns(ptr);
-    /* Arena disabled (reservation failed) fallback: sniff the page header. */
+    /* Arena disabled (reservation failed) fallback: sniff the page header — but
+     * ONLY after proving the pointer lies inside a span we actually mapped.
+     * Without this range check jet_page_of(ptr)->block_size reads unowned
+     * memory for a foreign pointer (segfault, or a false positive that routes a
+     * foreign block into jet_free). jet_owns is the interposer's safety gate;
+     * it must never dereference a pointer it doesn't own. */
     if (jet_arena_disabled()) {
+        if (!jet_span_contains(ptr)) return 0;
         jet_page* pg = jet_page_of(ptr);
         return pg->block_size >= 8 && pg->block_size <= JET_LARGE_THRESHOLD &&
                pg->capacity > 0 && pg->cls < JET_NUM_CLASSES;

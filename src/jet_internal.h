@@ -388,6 +388,10 @@ static JET_ALWAYS_INLINE int jet_arena_contains_inline(const void* ptr) {
 }
 int   jet_arena_contains(const void* ptr);   /* out-of-line mirror             */
 int   jet_arena_disabled(void);            /* 1 iff arena reservation failed  */
+/* Range-check ptr against the spans jetalloc actually mmapped (jet_central.c).
+ * Used ONLY on the arena-disabled fallback so jet_owns() proves ownership by
+ * range before dereferencing a page header — never reads a foreign pointer. */
+int   jet_span_contains(const void* ptr);
 
 /* ── NUMA / topology-aware placement (jet_numa.c) ─────────────────────────
  * Bind freshly-mapped spans to the local NUMA node so a thread's allocations

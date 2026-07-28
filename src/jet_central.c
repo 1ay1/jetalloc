@@ -35,6 +35,49 @@ static jet_page* free_pages   = NULL;
 static uint8_t*  span_cursor  = NULL;
 static uint8_t*  span_end     = NULL;
 
+/* ── Span registry (arena-disabled ownership proof) ────────────────────────
+ * When the 64 GiB arena reservation succeeds, jet_owns() proves ownership with
+ * a single range compare and never touches memory. When it FAILS (ASan shadow
+ * collision, tight overcommit, ulimits) jetalloc falls back to per-span mmaps
+ * and there is no single range to test against — the old fallback sniffed the
+ * page header of *any* pointer, which READS unowned memory for a foreign block
+ * (segfault, or a false-positive that routes a foreign pointer into jet_free →
+ * corruption). This registry records every span we map so the fallback can
+ * range-check FIRST and only dereference pointers that provably lie inside a
+ * jetalloc span. Written under central_lock (cold, one entry per 4 MiB span);
+ * read locklessly by jet_span_contains via relaxed atomics. */
+typedef struct { _Atomic(uintptr_t) base; _Atomic(uintptr_t) end; } jet_span_rec;
+#define JET_SPAN_REG_CAP 4096u    /* 4096 * 4 MiB = 16 GiB of slab spans      */
+static jet_span_rec span_reg[JET_SPAN_REG_CAP];
+static _Atomic(uint32_t) span_reg_len = 0;   /* published count (monotonic)   */
+
+/* Record [base, base+len). Caller holds central_lock. Silently drops spans past
+ * capacity — jet_span_contains then reports "not ours" for them, which is the
+ * safe direction (a missed span never causes a foreign deref; at worst a genuine
+ * jetalloc block is freed via the slow full path, still correct). */
+static void span_reg_add(uint8_t* base, size_t len) {
+    uint32_t n = atomic_load_explicit(&span_reg_len, memory_order_relaxed);
+    if (n >= JET_SPAN_REG_CAP) return;
+    atomic_store_explicit(&span_reg[n].base, (uintptr_t)base, memory_order_relaxed);
+    atomic_store_explicit(&span_reg[n].end,  (uintptr_t)base + len, memory_order_relaxed);
+    /* Publish the slot's fields BEFORE the length that makes it visible. */
+    atomic_store_explicit(&span_reg_len, n + 1, memory_order_release);
+}
+
+/* True iff ptr lies inside a span jetalloc mapped. Lockless, no memory loads of
+ * the pointed-to object. Acquire-loads the length to pair with span_reg_add's
+ * release, so a reader that sees slot n also sees its fully-written base/end. */
+int jet_span_contains(const void* ptr) {
+    uintptr_t p = (uintptr_t)ptr;
+    uint32_t n = atomic_load_explicit(&span_reg_len, memory_order_acquire);
+    for (uint32_t i = 0; i < n; ++i) {
+        uintptr_t b = atomic_load_explicit(&span_reg[i].base, memory_order_relaxed);
+        uintptr_t e = atomic_load_explicit(&span_reg[i].end,  memory_order_relaxed);
+        if (p - b < e - b) return 1;
+    }
+    return 0;
+}
+
 /* ── Cache coloring ───────────────────────────────────────────────────────
  * Every page's block data would otherwise start at the SAME offset
  * (sizeof(jet_page) rounded up), so block N of every page maps to the SAME L1
@@ -64,6 +107,9 @@ static jet_page* raw_page(int* mem_fresh) {
         if (!span) return NULL;
         span_cursor = span;
         span_end    = span + JET_SPAN_SIZE;
+        /* Record the span so a disabled-arena jet_owns() can prove ownership by
+         * range before ever dereferencing a page header (foreign-ptr safety). */
+        span_reg_add(span, JET_SPAN_SIZE);
     }
     jet_page* pg = (jet_page*)span_cursor;
     span_cursor += JET_PAGE_SIZE;

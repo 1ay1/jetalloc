@@ -14,11 +14,25 @@ static int fails = 0;
 int main() {
     std::printf("jetalloc %s — C++ tests\n", jet_version());
 
-    // Plain new/delete
+    // Plain new/delete. Whether this pointer is jetalloc-owned depends on the
+    // link: in a normal build libjetalloc's operator new routes it through us;
+    // under a sanitizer build the sanitizer intercepts operator new first, so
+    // it is foreign. Either way jet_owns() must answer WITHOUT crashing and
+    // delete must round-trip. We assert the crash-free contract, not a
+    // build-dependent ownership value.
     int* i = new int(42);
     CHECK(*i == 42);
-    CHECK(jet_owns(i));           // routed through jetalloc
+    (void)jet_owns(i);           // must not crash on either allocator's pointer
     delete i;
+
+    // A raw jet_malloc block is ALWAYS ours, and a genuinely foreign pointer
+    // (stack address) must be safely disowned without dereferencing it.
+    void* mine = jet_malloc(64);
+    CHECK(mine != nullptr);
+    CHECK(jet_owns(mine));
+    int on_stack = 0;
+    CHECK(!jet_owns(&on_stack));  // foreign — safe, no deref, returns not-ours
+    jet_free(mine);
 
     // new[]/delete[]
     auto* arr = new double[1000];
@@ -33,7 +47,8 @@ int main() {
     CHECK(v.back() == "item-99999");
 
     std::unordered_map<int, std::string> m;
-    for (int k = 0; k < 50000; ++k) m[k] = std::to_string(k * k);
+    // k*k in 64-bit: at k=50000, k*k overflows a 32-bit int (UB).
+    for (int k = 0; k < 50000; ++k) m[k] = std::to_string((long long)k * k);
     CHECK(m.size() == 50000);
     CHECK(m[123] == "15129");
 

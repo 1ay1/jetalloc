@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/mman.h>
+#endif
 
 static int fails = 0;
 #define CHECK(cond) do { if (!(cond)) { \
@@ -95,10 +98,37 @@ static void test_distinct_pointers(void) {
 }
 
 static void test_foreign_safe(void) {
+    /* jet_owns() is the interposer's safety gate: on ANY pointer we did not
+     * allocate it must answer "not ours" WITHOUT dereferencing it (a foreign
+     * deref segfaults, or a false positive routes a foreign block into jet_free
+     * → corruption). Throw a spread of genuinely foreign pointers at it. */
     int stack_var = 7;
-    CHECK(jet_owns(&stack_var) == 0);     /* not ours → reported foreign */
+    CHECK(jet_owns(&stack_var) == 0);      /* stack — not ours              */
     CHECK(jet_usable_size(&stack_var) == 0);
-    jet_free(NULL);                        /* free(NULL) is a no-op */
+    jet_free(NULL);                         /* free(NULL) is a no-op         */
+    /* NB: we do NOT call jet_free(&stack_var). Like libc free(), jet_free()'s
+     * contract is "a pointer THIS allocator returned" — feeding it foreign
+     * memory is UB. The drop-in interposer (jet_override.*) is what makes
+     * free()/delete safe on foreign pointers, and it does so by screening with
+     * jet_owns() first — which is exactly what the checks in this test cover. */
+
+    /* A fresh, independent mmap region jetalloc never handed out. Both a
+     * page-aligned and an interior (non-aligned) pointer must be disowned
+     * without reading the region. This is the case that crashed under a
+     * disabled arena before the span-registry range check. */
+#if defined(__unix__) || defined(__APPLE__)
+    void* region = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (region != MAP_FAILED) {
+        CHECK(jet_owns(region) == 0);             /* page-aligned foreign  */
+        CHECK(jet_owns((char*)region + 17) == 0); /* interior foreign      */
+        CHECK(jet_usable_size(region) == 0);
+        munmap(region, 4096);
+    }
+#endif
+
+    /* A low, obviously-invalid pointer must also be safely disowned. */
+    CHECK(jet_owns((void*)0x1234) == 0);
 }
 
 int main(void) {
