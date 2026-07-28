@@ -131,6 +131,38 @@ c++ myapp.cpp -ljetalloc
 LD_PRELOAD=./build/libjetalloc.so  ./your_program
 ```
 
+**Modern C++** (`#include <jetalloc.hpp>`, C++17 or newer; targets C++23 and
+degrades gracefully) — an idiomatic `jet::` skin over the C ABI. You rarely
+need it: once linked, `new` / `make_unique` / every `std::` container is
+already on jetalloc. Reach for the header when you want to touch the allocator
+*explicitly* — RAII page reclamation, a container bound to jetalloc by type,
+or a `std::pmr` resource:
+
+```cpp
+#include <jetalloc.hpp>
+
+// RAII: hand freed pages back to the OS when the scope ends (even on throw).
+void handle(const Request& r) {
+    jet::scoped_trim _;
+    // ... transient allocation ...
+}
+
+// A std-conformant allocator that binds storage to jetalloc BY TYPE —
+// jet::owns(v.data()) is then true regardless of how the program linked.
+std::vector<int, jet::allocator<int>> v;      // or: jet::vector<int>
+jet::string s;                                 // basic_string on jetalloc
+
+// unique_ptr whose object lives on jetalloc storage (empty deleter → the
+// unique_ptr stays pointer-sized). Strongly exception-safe.
+auto up = jet::allocate_unique<Widget>(args...);
+
+// A std::pmr::memory_resource backed by jetalloc.
+std::pmr::vector<std::pmr::string> pv{jet::memory_resource()};
+
+// Typed introspection.
+jet::stats_t st = jet::stats();               // st.pages_active, st.bytes_live, ...
+```
+
 ## API
 
 ```c

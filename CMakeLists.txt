@@ -139,6 +139,16 @@ if(JET_BUILD_TESTS)
     target_compile_options(jet_test_cpp PRIVATE $<$<CONFIG:Release>:-O2>)
     add_test(NAME jet_test_cpp COMMAND jet_test_cpp)
 
+    # The modern C++23 header (jetalloc.hpp). Compiled at C++23 specifically —
+    # the library default is C++17 and the header degrades to it, but the test
+    # exercises the full concept-constrained surface, so pin the newer
+    # standard here. Same -O2 pin as jet_test_cpp for the GCC 16 -O3 miscompile.
+    add_executable(jet_test_hpp test/jet_test_hpp.cpp)
+    target_link_libraries(jet_test_hpp PRIVATE jetalloc)
+    target_compile_features(jet_test_hpp PRIVATE cxx_std_23)
+    target_compile_options(jet_test_hpp PRIVATE $<$<CONFIG:Release>:-O2>)
+    add_test(NAME jet_test_hpp COMMAND jet_test_hpp)
+
     add_executable(jet_test_mt test/jet_test_mt.c)
     target_link_libraries(jet_test_mt PRIVATE jetalloc Threads::Threads)
     add_test(NAME jet_test_mt COMMAND jet_test_mt)
@@ -173,5 +183,6 @@ if(JET_IS_TOPLEVEL)
     install(TARGETS ${_jet_install_targets}
             ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
             LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
-    install(FILES include/jetalloc.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    install(FILES include/jetalloc.h include/jetalloc.hpp
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif()
