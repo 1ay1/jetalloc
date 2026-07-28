@@ -234,6 +234,10 @@ byte or word per 64 KiB of VA, indexed by `addr >> 16`) gives an **exact O(1)
 owner/sizeclass lookup with zero header touch**, which also makes the interposer
 100% safe (no false "owns"). On a 48-bit VA a `addr>>16` byte-map is 4 GB *of
 virtual* address but only the touched pages commit — pairs perfectly with #12.
+(Orthogonal to *speed*: `jet_owns()` is already **crash-safe** on every input —
+foreign/stack pointers, page-aligned look-alikes, and freed large mappings are
+rejected without dereferencing unmapped memory, ASan/UBSan regression-locked.
+The pagemap would make ownership *exact and header-free*, not merely safe.)
 
 ### 7. Two-level "transfer cache" / magazines between tcache and central
 **Source:** tcmalloc transfer cache, Hoard magazines. When the thread cache

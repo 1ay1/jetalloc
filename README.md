@@ -92,14 +92,18 @@ startup rather than the allocator.)*
   one-page header so `free` / `usable_size` / `owns` are O(1).
 - **Crash-proof interposition.** `free()` consults `jet_owns()` and forwards
   foreign pointers to the real libc `free` — so replacing the system allocator
-  can't corrupt the heap on a pointer jetalloc didn't hand out.
+  can't corrupt the heap on a pointer jetalloc didn't hand out. `jet_owns()` is
+  hardened to return safely (never dereference unmapped memory) on *any* input:
+  foreign heap/stack addresses, page-aligned pointers that resemble a large
+  block, and already-freed large mappings are all rejected without a crash,
+  including in the arena-disabled fallback. Regression-locked under ASan/UBSan.
 
 ## Build
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build          # 3 suites: C, C++, multithread — all pass
+ctest --test-dir build          # 5 suites: C, C++, mt, cross-thread, large-mt
 ./build/jet_bench               # jetalloc numbers
 ./build/jet_bench_system        # system-allocator baseline
 ```
@@ -170,8 +174,9 @@ the ones measured, documented, and deliberately left **off** by default.
 
 ## Status
 
-Correct (100 % of the test suite — C, C++, and an 8-thread cross-thread-free
-stress; TSan + ASan/UBSan clean on the concurrent paths) and, through the
+Correct (100 % of the test suite — C, C++, an 8-thread cross-thread-free stress,
+and a multithreaded large-allocation stress; TSan + ASan/UBSan clean on the
+concurrent paths, including the `JET_PLACE=1` / `JET_PERCPU=1` modes) and, through the
 identical `LD_PRELOAD` drop-in interface, **the fastest of the five allocators
 measured on three of four workloads** (small-fixed, mixed-size, threaded), and a
 clear #2 behind jemalloc on cross-thread producer/consumer — a gap that is
