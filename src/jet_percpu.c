@@ -39,6 +39,32 @@
 #  define JET_HAVE_RSEQ 0
 #endif
 
+/* ThreadSanitizer happens-before annotations. The block handoff between a
+ * freeing thread (push) and a later allocating thread (pop) is made safe by the
+ * rseq restartable-sequence semantics in jet_rseq.S — hand-written asm that
+ * TSan's instrumentation cannot see. Without help TSan reports a spurious data
+ * race on the reused block's payload (old owner's read vs new owner's write)
+ * because it has no synchronizes-with edge through the opaque asm. Teaching it
+ * the edge with release-on-push / acquire-on-pop keyed on the block address
+ * makes `JET_PERCPU=1` runs TSan-clean without a blanket suppression. Compiles
+ * to nothing outside a TSan build. */
+#if defined(__SANITIZE_THREAD__)
+#  define JET_TSAN 1
+#elif defined(__has_feature)
+#  if __has_feature(thread_sanitizer)
+#    define JET_TSAN 1
+#  endif
+#endif
+#if defined(JET_TSAN)
+void __tsan_acquire(void*);
+void __tsan_release(void*);
+#  define JET_TSAN_ACQUIRE(p) __tsan_acquire(p)
+#  define JET_TSAN_RELEASE(p) __tsan_release(p)
+#else
+#  define JET_TSAN_ACQUIRE(p) ((void)0)
+#  define JET_TSAN_RELEASE(p) ((void)0)
+#endif
+
 #if JET_HAVE_RSEQ
 
 /* Hot-path guard (see jet_internal.h). 0 until init arms the per-CPU cache. */
@@ -113,6 +139,9 @@ void* jet_percpu_pop(int cls) {
     void* b = jet_rseq_pop((void*)g_slabs, g_stride,
                            (long)cls * (long)sizeof(void*), g_rseq_off);
     if (b) {
+        /* Acquire: pair with the JET_TSAN_RELEASE in push so TSan sees the
+         * freeing thread's writes happen-before our reuse of this block. */
+        JET_TSAN_ACQUIRE(b);
         /* Decrement the depth counter for wherever we are now. Advisory. */
         unsigned cpu = jet_cur_cpu();
         if (cpu < (unsigned)g_ncpu) {
@@ -133,6 +162,9 @@ int jet_percpu_push(int cls, void* block) {
      * stays bounded. Relaxed read is fine — the cap is soft. */
     if (atomic_load_explicit(d, memory_order_relaxed) >= JET_PERCPU_MAX)
         return 0;
+    /* Release: publish this thread's writes to the block before it becomes
+     * visible to a later popper (pairs with JET_TSAN_ACQUIRE in pop). */
+    JET_TSAN_RELEASE(block);
     int ok = jet_rseq_push((void*)g_slabs, g_stride,
                            (long)cls * (long)sizeof(void*), g_rseq_off, block);
     if (ok) {
