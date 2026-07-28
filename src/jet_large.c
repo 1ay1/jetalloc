@@ -45,8 +45,14 @@ void* jet_large_alloc(size_t size, size_t align) {
      *     for any alignment > 64 KiB (a C11/POSIX contract violation). */
     size_t headroom = (align > JET_PAGE_SIZE) ? align : JET_PAGE_SIZE;
 
-    /* Reserve headroom + rounded payload. */
+    /* Reserve headroom + rounded payload. Guard every step against wrap: a huge
+     * `size` (near SIZE_MAX) would otherwise round/round-add to a SMALL total,
+     * mmap a tiny region, and hand back a pointer the caller believes is huge
+     * -> heap overflow. Fail with NULL instead (malloc -> NULL, posix_memalign
+     * -> ENOMEM), which is the correct out-of-memory answer. */
+    if (size > SIZE_MAX - JET_PAGE_SIZE) return NULL;      /* rounding wraps    */
     size_t payload_rounded = (size + JET_PAGE_SIZE - 1) & ~((size_t)JET_PAGE_SIZE - 1);
+    if (payload_rounded > SIZE_MAX - headroom) return NULL; /* total wraps      */
     size_t total = headroom + payload_rounded;
 
     void* base = jet_os_map_aligned(total, align);

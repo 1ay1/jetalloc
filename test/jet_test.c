@@ -80,6 +80,15 @@ static void test_calloc_zeroed(void) {
     }
     volatile size_t huge = (size_t)-1;
     CHECK(jet_calloc(huge, 2) == NULL);  /* overflow guarded */
+
+    /* Huge single-allocation sizes must fail cleanly (NULL / ENOMEM), never
+     * wrap the large-path rounding to a tiny mapping and hand back a pointer
+     * the caller believes is huge (that would be a heap overflow). */
+    CHECK(jet_malloc((size_t)-1) == NULL);
+    CHECK(jet_malloc((size_t)-4096) == NULL);
+    CHECK(jet_malloc((size_t)-65535) == NULL);
+    void* qq = (void*)0x1;
+    CHECK(jet_posix_memalign(&qq, 4096, (size_t)-10) == 12 /* ENOMEM */);
 }
 
 static void test_realloc(void) {
