@@ -28,8 +28,12 @@ _Atomic(size_t) jet_stat_free_calls  = 0;
  * reserve 64 GiB of address space (free; the kernel commits lazily on touch).
  * If the reservation fails (32-bit, ASLR pressure, overcommit off) we fall back
  * to per-span mmap and the slower header-sniff owns(). */
-#if !defined(_WIN32) && defined(__LP64__)
-#  define JET_ARENA_BYTES  ((size_t)64 * 1024 * 1024 * 1024)   /* 64 GiB VA     */
+#if defined(__LP64__) || defined(_WIN64) || (defined(_WIN32) && defined(_M_AMD64))
+#  if defined(_WIN32)
+#    define JET_ARENA_BYTES  ((size_t)32 * 1024 * 1024 * 1024)   /* 32 GiB VA */
+#  else
+#    define JET_ARENA_BYTES  ((size_t)64 * 1024 * 1024 * 1024)   /* 64 GiB VA */
+#  endif
 /* The arena base, published for the INLINE single-compare ownership test in
  * jet_internal.h. Sentinel for "no arena": UINTPTR_MAX, chosen so the unsigned
  * wrap trick (p - base < JET_ARENA_BYTES) is false for every real pointer
@@ -44,9 +48,15 @@ static _Atomic(uintptr_t) g_arena_cur  = 0;   /* bump cursor (atomic)          *
 /* Reserve the arena once. Idempotent; safe under races (first winner keeps it).*/
 static void arena_reserve(void) {
     if (atomic_load_explicit(&g_arena_base, memory_order_acquire)) return;
+#if defined(_WIN32)
+    /* Reserve VA only; each span commits on demand via MEM_COMMIT. */
+    void* p = VirtualAlloc(NULL, JET_ARENA_BYTES, MEM_RESERVE, PAGE_NOACCESS);
+    if (!p) return;                                    /* fall back to per-span */
+#else
     void* p = mmap(NULL, JET_ARENA_BYTES, PROT_NONE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED) return;                       /* fall back to per-span */
+#endif
     uintptr_t base = (uintptr_t)p;
     uintptr_t expect = 0;
     if (atomic_compare_exchange_strong_explicit(
@@ -59,7 +69,11 @@ static void arena_reserve(void) {
          * pointer down the safe header-sniff path. Never a false positive. */
         __atomic_store_n(&jet_arena_base_pub, base, __ATOMIC_RELEASE);
     } else {
+#if defined(_WIN32)
+        VirtualFree(p, 0, MEM_RELEASE);                /* lost the race         */
+#else
         munmap(p, JET_ARENA_BYTES);                    /* lost the race         */
+#endif
     }
 }
 
@@ -77,11 +91,17 @@ static void* arena_carve(size_t bytes, size_t align) {
                 &g_arena_cur, &cur, next,
                 memory_order_acq_rel, memory_order_relaxed))
             continue;
-        /* Commit the slice R/W over the reserved range (MAP_FIXED replaces the
-         * PROT_NONE placeholder in place). */
+        /* Commit the carved slice R/W. On Windows MEM_COMMIT backs the
+         * already-reserved range with pages; on POSIX MAP_FIXED replaces
+         * the PROT_NONE placeholder in place. */
+#if defined(_WIN32)
+        void* got = VirtualAlloc((void*)aligned, bytes, MEM_COMMIT, PAGE_READWRITE);
+        if (!got) return NULL;
+#else
         void* got = mmap((void*)aligned, bytes, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
         if (got == MAP_FAILED) return NULL;
+#endif
         return (void*)aligned;
     }
 }
@@ -105,7 +125,7 @@ int jet_arena_disabled(void) {
 uintptr_t jet_arena_base_pub = UINTPTR_MAX;
 int jet_arena_contains(const void* ptr) { (void)ptr; return 0; }
 int jet_arena_disabled(void) { return 1; }
-#endif
+#endif  /* arena-capable target */
 
 void* jet_os_map(size_t bytes) {
     return jet_os_map_aligned(bytes, JET_PAGE_SIZE);
@@ -182,7 +202,7 @@ void* jet_os_map_aligned(size_t bytes, size_t align) {
  * unavailable or full. Large direct allocations deliberately do NOT use this —
  * they munmap individually on free, which would punch holes in the arena. */
 void* jet_os_map_span(size_t bytes, size_t align) {
-#if !defined(_WIN32) && defined(__LP64__)
+#if defined(__LP64__) || defined(_WIN64) || (defined(_WIN32) && defined(_M_AMD64))
     arena_reserve();
     void* acar = arena_carve(bytes, align);
     if (acar) {
@@ -200,8 +220,18 @@ void* jet_os_map_span(size_t bytes, size_t align) {
 void jet_os_unmap(void* p, size_t bytes) {
     if (!p) return;
 #if defined(_WIN32)
-    (void)bytes;
-    VirtualFree(p, 0, MEM_RELEASE);
+    /* Arena-carved spans live inside one big MEM_RESERVE region: they were
+     * committed with MEM_COMMIT, so they must be DECOMMITTED (MEM_DECOMMIT),
+     * never MEM_RELEASE'd (which only accepts a reservation base and would
+     * fail on a sub-range, leaking or corrupting the arena). Standalone
+     * spans (arena off/full) were MEM_RESERVE|MEM_COMMIT'd at their own base
+     * and are released whole. */
+    if (jet_arena_contains(p)) {
+        VirtualFree(p, bytes, MEM_DECOMMIT);
+    } else {
+        (void)bytes;
+        VirtualFree(p, 0, MEM_RELEASE);
+    }
 #else
     munmap(p, bytes);
 #endif
