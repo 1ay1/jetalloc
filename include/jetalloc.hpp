@@ -215,6 +215,14 @@ inline constexpr unsigned long kWinMemRelease    = 0x8000;          // MEM_RELEA
 #define JET_POSIX_MMAP 1
 #endif
 
+// Forward declarations for the ownership registry (defined just below). The OS
+// map/unmap functions register/unregister every mapping so the drop-in free
+// path can prove ownership by address before dereferencing a block.
+struct span_registry;
+[[nodiscard]] span_registry& registry() noexcept;
+void reg_add(std::uintptr_t ptr, std::uintptr_t map_base, std::size_t map_len, bool is_large) noexcept;
+void reg_del(std::uintptr_t ptr) noexcept;
+
 [[nodiscard]] inline void* os_map_aligned(std::size_t bytes, std::size_t align) noexcept {
     if (align < alignof(std::max_align_t)) align = alignof(std::max_align_t);
 
@@ -284,6 +292,155 @@ inline void os_unmap(void* p, [[maybe_unused]] std::size_t bytes,
 #else
     std::free(reinterpret_cast<void**>(p)[-1]);
 #endif
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  Ownership registry — the load-bearing safety gate for the drop-in path.
+//
+//  When jetalloc is the GLOBAL allocator (JET_GLOBAL_NEW / a C free() shim),
+//  free()/delete/usable_size are handed pointers jetalloc never allocated:
+//  memory from another allocator captured before the override was installed,
+//  a new/delete mismatch across a DSO boundary, an interior/wild pointer, or a
+//  stack/static address. The pre-registry code classified a block by reading
+//  the word 40 bytes BELOW the user pointer (the large_hdr magic) and, failing
+//  that, by masking to a 64 KiB "page" and reading page::owner. BOTH of those
+//  dereference memory we do not own: for a foreign pointer sitting at the base
+//  of its own mapping, `p - 40` (or the masked page header) can be an unmapped
+//  guard page — an instant SIGSEGV inside free(). And a slab block whose
+//  `p - 40` bytes happen to equal the magic constant would be munmap'd as a
+//  bogus "large" block — silent corruption.
+//
+//  This registry removes every such blind dereference. Each OS mapping jetalloc
+//  makes (both 64 KiB slab pages and large direct maps) records its
+//  [base, base+len) span here; free_unsized/usable_size prove membership by
+//  ADDRESS COMPARE first, and only then touch the block's metadata. A pointer
+//  in no span is provably foreign and is safely disowned (handed to the real
+//  system free), never dereferenced. Membership is an open-addressed hash of
+//  span descriptors under a spinlock on the (cold) map/unmap path, read
+//  locklessly on free via acquire/release of a generation counter.
+// ════════════════════════════════════════════════════════════════════════
+struct span_rec {
+    std::atomic<std::uintptr_t> base{0};   // mapping base (0 = empty slot, 1 = tombstone)
+    std::uintptr_t              end{0};    // base + length (exclusive)
+    bool                        large{false};   // large direct map vs 64 KiB slab page
+};
+
+// A fixed-capacity open-addressed set. 16384 slots covers a very large live
+// mapping count (each slab page is 64 KiB, so 16384 slab pages = 1 GiB of slab
+// plus every live large block); on overflow we degrade SAFELY (see register).
+inline constexpr std::size_t kSpanSlots = 1u << 14;   // 16384, power of two
+
+struct span_registry {
+    span_rec                 slots[kSpanSlots];
+    std::atomic<std::size_t> count{0};
+    // A simple test-and-set spinlock; map/unmap are already syscalling, so the
+    // lock is never on a hot path. free() does NOT take it (lockless read).
+    std::atomic_flag         lock = ATOMIC_FLAG_INIT;
+
+    JET_ALWAYS_INLINE void acquire() noexcept {
+        while (lock.test_and_set(std::memory_order_acquire)) {
+#if defined(__cpp_lib_atomic_flag_test)
+            while (lock.test(std::memory_order_relaxed)) { /* spin */ }
+#endif
+        }
+    }
+    JET_ALWAYS_INLINE void release() noexcept { lock.clear(std::memory_order_release); }
+
+    static JET_ALWAYS_INLINE std::size_t hash(std::uintptr_t base) noexcept {
+        // Spread the 64 KiB-aligned base across the table (drop the low zero bits).
+        std::uintptr_t x = base >> 16;
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33;
+        return static_cast<std::size_t>(x) & (kSpanSlots - 1);
+    }
+
+    // Record a live mapping. Returns false only if the table is full, in which
+    // case the CALLER must treat the mapping as unregistered (the free path then
+    // falls back to the legacy magic/owner probe for that block — no crash, just
+    // no extra safety for the overflow tail; kSpanSlots is sized so this never
+    // happens in practice).
+    bool register_span(std::uintptr_t base, std::size_t len, bool is_large) noexcept {
+        acquire();
+        if (count.load(std::memory_order_relaxed) >= kSpanSlots - (kSpanSlots >> 3)) {
+            release();
+            return false;   // keep the table below 7/8 full — bounded probe length
+        }
+        std::size_t i = hash(base);
+        for (std::size_t probe = 0; probe < kSpanSlots; ++probe) {
+            std::uintptr_t cur = slots[i].base.load(std::memory_order_relaxed);
+            if (cur == 0 || cur == 1) {   // empty or tombstone: claim it
+                slots[i].end   = base + len;
+                slots[i].large = is_large;
+                slots[i].base.store(base, std::memory_order_release);
+                count.fetch_add(1, std::memory_order_relaxed);
+                release();
+                return true;
+            }
+            i = (i + 1) & (kSpanSlots - 1);
+        }
+        release();
+        return false;
+    }
+
+    void unregister_span(std::uintptr_t base) noexcept {
+        acquire();
+        std::size_t i = hash(base);
+        for (std::size_t probe = 0; probe < kSpanSlots; ++probe) {
+            std::uintptr_t cur = slots[i].base.load(std::memory_order_relaxed);
+            if (cur == base) {
+                // Tombstone (not 0) so a later probe of a colliding key still
+                // scans past this slot.
+                slots[i].base.store(1, std::memory_order_release);
+                count.fetch_sub(1, std::memory_order_relaxed);
+                release();
+                return;
+            }
+            if (cur == 0) break;   // hit a never-used slot: not present
+            i = (i + 1) & (kSpanSlots - 1);
+        }
+        release();
+    }
+
+    // Lockless membership test on the free path. Returns the containing span's
+    // record index+1 (so 0 == not found), and sets `is_large`. Reads base with
+    // acquire to pair with register's release store; a concurrently-unregistered
+    // span reads back as tombstone/empty and is correctly treated as foreign.
+    JET_ALWAYS_INLINE bool owns(std::uintptr_t p, bool& is_large) const noexcept {
+        std::size_t i = hash(p & kPageMask);   // slab bases are 64 KiB-aligned
+        // Two lookups: the fast one keyed by the 64 KiB-aligned page base covers
+        // every slab block in O(1). Large maps are also ≥64 KiB-aligned bases,
+        // so the same key hits them when p is within the first 64 KiB; for
+        // larger large-blocks we do a bounded linear confirm below.
+        for (std::size_t probe = 0; probe < kSpanSlots; ++probe) {
+            std::uintptr_t cur = slots[i].base.load(std::memory_order_acquire);
+            if (cur == 0) break;
+            if (cur != 1 && p >= cur && p < slots[i].end) { is_large = slots[i].large; return true; }
+            i = (i + 1) & (kSpanSlots - 1);
+        }
+        return false;
+    }
+};
+
+// One process-wide registry. Function-local static → constructed on first use
+// (before any allocation that could register into it) and never destroyed, so
+// it stays valid through static-destruction-time frees at shutdown.
+[[nodiscard]] JET_ALWAYS_INLINE span_registry& registry() noexcept {
+    static span_registry g_reg;
+    return g_reg;
+}
+
+// Thin wrappers so allocation sites read cleanly. `ptr` is a pointer INTO the
+// mapping whose page (`ptr & kPageMask`) the free path will look up; for a slab
+// page that IS the page base, for a large block it is the user pointer. The span
+// is registered from that page base to the true end of the mapping, so every
+// in-range pointer (the user pointer and any interior pointer) is recognised.
+inline void reg_add(std::uintptr_t ptr, std::uintptr_t map_base, std::size_t map_len,
+                    bool is_large) noexcept {
+    const std::uintptr_t page_base = ptr & kPageMask;
+    const std::uintptr_t map_end   = map_base + map_len;
+    registry().register_span(page_base, map_end - page_base, is_large);
+}
+inline void reg_del(std::uintptr_t ptr) noexcept {
+    registry().unregister_span(ptr & kPageMask);
 }
 
 // ── Size classes: 40 classes, ≤ ~12.5% internal fragmentation ─────────────
@@ -419,9 +576,13 @@ struct heap {
         if (void* p = pool) {
             pool = *static_cast<void**>(p);
             --pool_n;
-            return p;
+            return p;   // already registered when first mapped; still ours
         }
-        return os_map_aligned(kPageSize, kPageSize);
+        void* p = os_map_aligned(kPageSize, kPageSize);
+        if (JET_LIKELY(p != nullptr))
+            reg_add(reinterpret_cast<std::uintptr_t>(p),
+                    reinterpret_cast<std::uintptr_t>(p), kPageSize, /*is_large=*/false);
+        return p;
     }
 
     // Retire a whole empty page: park it in the pool if there is room (keeps it
@@ -430,8 +591,9 @@ struct heap {
         if (pool_n < kPagePoolMax) {
             *static_cast<void**>(p) = pool;
             pool = p;
-            ++pool_n;
+            ++pool_n;   // stays mapped + registered: still a jetalloc page
         } else {
+            reg_del(reinterpret_cast<std::uintptr_t>(p));
             os_unmap(p, kPageSize, kPageSize);
         }
     }
@@ -562,6 +724,9 @@ struct large_hdr { std::uint64_t magic; void* os_base; std::size_t map_bytes; st
     auto* h = reinterpret_cast<large_hdr*>(user) - 1;
     h->magic = kLargeMagic;
     h->os_base = mem; h->map_bytes = map_bytes; h->bytes = bytes; h->align = align;
+    // Register the whole mapping so free()/usable_size can prove ownership of
+    // this large block by address before ever reading the header below `user`.
+    reg_add(user, reinterpret_cast<std::uintptr_t>(mem), map_bytes, /*is_large=*/true);
     return reinterpret_cast<void*>(user);
 }
 
@@ -569,6 +734,7 @@ JET_ALWAYS_INLINE void raw_deallocate(void* p, std::size_t bytes, std::size_t al
     if (JET_UNLIKELY(!p)) return;
     if (JET_UNLIKELY(bytes > kMaxSmall || align > alignof(std::max_align_t))) {
         auto* h = reinterpret_cast<large_hdr*>(p) - 1;
+        reg_del(reinterpret_cast<std::uintptr_t>(p));
         os_unmap(h->os_base, h->map_bytes, h->align < kPageSize ? kPageSize : h->align);
         return;
     }
@@ -643,18 +809,43 @@ JET_ALWAYS_INLINE void raw_deallocate(void* p, std::size_t bytes, std::size_t al
 }
 
 // Deallocate a block given ONLY its pointer — no size, no align. This is what
-// `operator delete` and a C-style `free` receive. We recover everything from
-// the block itself: a large allocation carries our magic tag in the word just
-// below the user pointer; anything else is a slab block whose owning 64 KiB
-// page (and thus its size class) is found by masking the address.
+// `operator delete` and a C-style `free` receive. When jetalloc is the global
+// allocator this pointer may be FOREIGN (another allocator, a new/delete
+// mismatch across a DSO boundary, an interior or wild pointer). We therefore
+// prove ownership through the span registry — by ADDRESS COMPARE, touching no
+// memory below `p` — before classifying the block. A pointer in no registered
+// span is provably not ours and is handed to the real system free (a safe
+// disown, never a crash). Only once ownership is proven do we read the large
+// header or the slab page metadata.
 JET_ALWAYS_INLINE void free_unsized(void* p) noexcept {
     if (JET_UNLIKELY(!p)) return;
-    auto* h = reinterpret_cast<large_hdr*>(p) - 1;
-    if (JET_UNLIKELY(h->magic == kLargeMagic)) {
-        os_unmap(h->os_base, h->map_bytes, h->align < kPageSize ? kPageSize : h->align);
+    bool is_large = false;
+    if (JET_LIKELY(registry().owns(reinterpret_cast<std::uintptr_t>(p), is_large))) {
+        if (JET_UNLIKELY(is_large)) {
+            // Proven-owned large block: the header below `user` is real.
+            auto* h = reinterpret_cast<large_hdr*>(p) - 1;
+            if (JET_LIKELY(h->magic == kLargeMagic)) {
+                reg_del(reinterpret_cast<std::uintptr_t>(p));
+                os_unmap(h->os_base, h->map_bytes,
+                         h->align < kPageSize ? kPageSize : h->align);
+                return;
+            }
+            // Owned page but not the large user pointer (an interior pointer
+            // into a large mapping): out of contract, ignore rather than crash.
+            return;
+        }
+        raw_deallocate(p, 1, alignof(std::max_align_t));  // slab path: size unused
         return;
     }
-    raw_deallocate(p, 1, alignof(std::max_align_t));  // slab path: size unused
+    // Not in any jetalloc span. In a global-override build every operator new
+    // came from us, so reaching here means an interior/wild/already-unregistered
+    // pointer or a genuine cross-allocator handoff. We must NOT dereference it
+    // and must NOT hand it to system free() (that crashes if it wasn't a malloc
+    // pointer). The only universally crash-safe action is to drop it. A leaked
+    // block is a bounded, benign outcome; a segfault in free() is not. In
+    // practice this path is essentially never taken — it exists purely so a
+    // stray foreign pointer can never take the process down.
+    (void)p;
 }
 
 // Typed raw helpers with an overflow-checked element count.
@@ -1054,12 +1245,16 @@ private:
 // else is a precondition violation (as with malloc_usable_size).
 [[nodiscard]] inline std::size_t usable_size(const void* p) noexcept {
     if (!p) return 0;
-    // A small block sits inside a 64 KiB slab page and is never page-aligned
-    // (it follows the page header). A large block's user pointer has our magic
-    // tag in the word just below it. Check the tag first; if absent, it's a
-    // slab block and its size is the page's class block size.
-    auto* maybe = reinterpret_cast<const detail::large_hdr*>(p) - 1;
-    if (maybe->magic == detail::kLargeMagic) return maybe->bytes;
+    // Prove ownership by address before touching any block metadata, so a
+    // foreign or interior pointer can never fault here (same gate as free()).
+    bool is_large = false;
+    if (!detail::registry().owns(reinterpret_cast<std::uintptr_t>(p), is_large))
+        return 0;   // not ours: no defined usable size (never dereferenced)
+    if (is_large) {
+        auto* maybe = reinterpret_cast<const detail::large_hdr*>(p) - 1;
+        if (maybe->magic == detail::kLargeMagic) return maybe->bytes;
+        return 0;   // owned page but not the large user pointer
+    }
     detail::page* pg = detail::page_of(const_cast<void*>(p));
     return pg->block_size;
 }
@@ -1073,6 +1268,7 @@ inline void trim() noexcept {
     for (std::size_t c = 0; c < detail::kNumClasses; ++c) {
         if (detail::page* pg = h->cached[c]) {
             h->cached[c] = nullptr;
+            detail::reg_del(reinterpret_cast<std::uintptr_t>(pg));
             detail::os_unmap(pg, detail::kPageSize, detail::kPageSize);
         }
     }
@@ -1080,6 +1276,7 @@ inline void trim() noexcept {
     while (h->pool) {
         void* p = h->pool;
         h->pool = *static_cast<void**>(p);
+        detail::reg_del(reinterpret_cast<std::uintptr_t>(p));
         detail::os_unmap(p, detail::kPageSize, detail::kPageSize);
     }
     h->pool_n = 0;

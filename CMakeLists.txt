@@ -69,6 +69,17 @@ if(JET_IS_TOPLEVEL)
     target_link_options(jet_test_global PRIVATE ${_jet_san_flags})
     add_test(NAME jet_test_global COMMAND jet_test_global)
 
+    # Drop-in SAFETY GATE: free()/delete/usable_size on FOREIGN pointers (system
+    # malloc, raw mmap page, stack/static/interior/wild) must never fault or
+    # corrupt when jetalloc is the global allocator. Built WITH JET_GLOBAL_NEW
+    # and under sanitizers so any blind dereference below a foreign pointer is
+    # caught. This is the regression test for the span-registry ownership gate.
+    add_executable(jet_test_foreign test/jet_test_foreign.cpp)
+    target_link_libraries(jet_test_foreign PRIVATE jetalloc)
+    target_compile_options(jet_test_foreign PRIVATE $<$<CONFIG:Release>:-O2> ${_jet_san_flags})
+    target_link_options(jet_test_foreign PRIVATE ${_jet_san_flags})
+    add_test(NAME jet_test_foreign COMMAND jet_test_foreign)
+
     # Hardened tier: prove JET_HARDENED turns heap corruption (double free,
     # interior/wild free, freelist-link tampering) into a defined abort. This
     # binary self-drives: it re-spawns itself per corruption case and asserts
