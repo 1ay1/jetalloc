@@ -53,6 +53,33 @@ static double mixed_size(std::size_t iters, Alloc a, Free f) {
     return mops(iters, clk::now() - t0);
 }
 
+// ── page-churn: alloc a BATCH big enough to span many slab pages, then free
+//    it all, repeatedly. This is the pattern that punishes a naive allocator on
+//    Windows: every batch grows past the per-class reserve and, without a page
+//    pool, each fresh page is a VirtualAlloc syscall and each freed page a
+//    VirtualFree. jetalloc's committed page pool makes the steady state
+//    syscall-free — this workload is where that shows up. ──────────────────────
+template <class Alloc, class Free>
+static double page_churn(std::size_t iters, Alloc a, Free f) {
+    constexpr std::size_t BATCH = 2048;   // ~ enough 64B blocks to cross pages
+    std::vector<void*> live(BATCH, nullptr);
+    std::mt19937 rng(999);
+    std::uniform_int_distribution<std::size_t> sz(16, 512);
+    const std::size_t rounds = iters / BATCH;
+    auto t0 = clk::now();
+    for (std::size_t r = 0; r < rounds; ++r) {
+        for (std::size_t i = 0; i < BATCH; ++i) {
+            std::size_t s = sz(rng);
+            void* p = a(s);
+            *static_cast<char*>(p) = static_cast<char>(i);
+            live[i] = p;
+            g_sink = p;
+        }
+        for (std::size_t i = 0; i < BATCH; ++i) f(live[i], 0);   // size unused by sys path
+    }
+    return mops(rounds * BATCH, clk::now() - t0);
+}
+
 int main() {
     constexpr std::size_t ITERS = 5'000'000;
 
@@ -71,6 +98,10 @@ int main() {
     double j2 = mixed_size(ITERS, jet_a, jet_f);
     double s2 = mixed_size(ITERS, sys_a, sys_f);
     std::printf("%-18s %12.1f %12.1f %9.2fx\n", "mixed-size(8-4K)", j2, s2, j2 / s2);
+
+    double j3 = page_churn(ITERS, jet_a, jet_f);
+    double s3 = page_churn(ITERS, sys_a, sys_f);
+    std::printf("%-18s %12.1f %12.1f %9.2fx\n", "page-churn(batch)", j3, s3, j3 / s3);
 
     return 0;
 }

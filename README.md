@@ -208,10 +208,22 @@ Every step of the fast path was engineered to be O(1) and syscall-free:
   allocatable.
 - **page geometry** (data start, capacity) is computed once when a page is
   created, never on the hot path.
-- **one empty page per size class is retained** as a reserve, so an alloc/free
-  churn loop never touches the OS.
+- **two tiers of syscall-free page reserve**: one empty page per size class is
+  retained in place, and a small **cross-class pool of committed 64 KiB pages**
+  absorbs churn that spills across classes. A grow-then-free-a-batch loop reuses
+  a pooled page with a plain relink — **zero syscalls in steady state**.
 - **`owned<T>` is a single allocation** — the borrow ledger is co-located with
   the object in the same block (and vanishes entirely under `-DJET_NO_CONTRACTS`).
+
+**Why this matters most on Windows.** On Linux `mmap`/`munmap` are cheap; on
+Windows every fresh slab page would otherwise be a `VirtualAlloc` kernel
+transition and every freed page a `VirtualFree`. The committed page pool keeps
+retired pages mapped **in-process**, so the hot churn path never crosses into
+the kernel — the same trick mimalloc uses to be fast on Windows, specialised to
+jetalloc's uniform 64 KiB pages. Measured effect below (`page-churn`): removing
+the pool drops that workload from **9.4× to 1.6×** — a **5.5×** swing, all of it
+saved syscalls. TLS is native (`%gs`-relative, no `__emutls` call) on the
+toolchains we ship, so `t_heap` access is a single segment load.
 
 Measured with `bench/jet_bench.cpp` (`-O2`, jetalloc vs. the platform allocator
 through the identical typed interface; Mops/s, higher = better):
@@ -220,6 +232,7 @@ through the identical typed interface; Mops/s, higher = better):
 |---|---:|---:|---:|
 | small-fixed (32 B) | **65–114** | ~15 | **4–7×** |
 | mixed-size (8 B–4 KiB) | **17–20** | ~8 | **~2.4×** |
+| page-churn (batch grow/free) | **~69** | ~7 | **~9×** |
 
 (Windows / UCRT, single core, `-O2`. Absolute Mops/s vary run-to-run and by
 machine — reproduce them yourself with `./build/jet_bench`. The *ratio* is the
@@ -265,9 +278,10 @@ jet::trim();                  // return this thread's cached empty pages to the 
   **not** interpose the system `operator new`/`malloc`. Use `jet::allocator<T>`
   for containers, the `owned<>`/`buffer` handles for objects.
 - **Pages are returned to the OS conservatively** — one empty page per size
-  class is retained per thread as a reserve; the rest are released on
-  `free` or explicit `jet::trim()`. Long-lived threads with spiky allocation
-  should call `trim()` after a burst to shrink RSS.
+  class plus a small cross-class pool of committed pages (≤ 1 MiB/thread) are
+  retained as a syscall-free reserve; the rest are released on `free`. Long-lived
+  threads with spiky allocation should call `jet::trim()` after a burst to drain
+  both the reserve and the pool and shrink RSS to the live set.
 - **The dynamic borrow checker is single-object**: it enforces aliasing-XOR on
   one `owned<T>` at a time, not a whole-program lifetime graph. It catches the
   common mistakes at a defined trap; it is not a substitute for a static

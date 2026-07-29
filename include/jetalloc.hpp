@@ -332,13 +332,45 @@ struct alignas(64) page {
 };
 
 // Per-thread heap. `partial[cls]` head is ALWAYS an allocatable page (full
-// pages are unlinked on the spot), so alloc_small never scans a list. One
-// emptied page per class is RETAINED (not returned to the OS) so an
-// alloc/free churn loop never hits a syscall — this is the mimalloc-style
-// "one free page in reserve" that keeps the hot path syscall-free.
+// pages are unlinked on the spot), so alloc_small never scans a list. Empty
+// pages are recycled through TWO tiers of syscall-free reserve:
+//   1. `cached[cls]`  — one retained empty page per class, re-armed in place.
+//   2. `pool` / `pool_n` — a small cross-class LIFO of whole 64 KiB pages that
+//      stay mapped-and-committed in-process. A grow/shrink pattern that spills
+//      across size classes (which tier 1 can't absorb) reuses a pooled page
+//      with ZERO syscall — a plain relink. On Windows this is the decisive win:
+//      it turns the steady state into no VirtualAlloc/VirtualFree at all. Only
+//      when the pool overflows (> kPagePoolMax) does a page go back to the OS.
 struct heap {
     page* partial[kNumClasses]{};
     page* cached[kNumClasses]{};   // one retained empty page per class
+
+    // Cross-class recycled-page freelist (whole 64 KiB pages, still committed).
+    static constexpr std::uint32_t kPagePoolMax = 16;   // ≤ 1 MiB parked/thread
+    void*         pool = nullptr;   // intrusive LIFO threaded through page memory
+    std::uint32_t pool_n = 0;
+
+    // Take a bare committed 64 KiB page: from the pool (no syscall) or the OS.
+    [[nodiscard]] JET_ALWAYS_INLINE void* take_raw_page() noexcept {
+        if (void* p = pool) {
+            pool = *static_cast<void**>(p);
+            --pool_n;
+            return p;
+        }
+        return os_map_aligned(kPageSize, kPageSize);
+    }
+
+    // Retire a whole empty page: park it in the pool if there is room (keeps it
+    // committed for instant reuse), else hand the memory back to the OS.
+    JET_ALWAYS_INLINE void give_raw_page(void* p) noexcept {
+        if (pool_n < kPagePoolMax) {
+            *static_cast<void**>(p) = pool;
+            pool = p;
+            ++pool_n;
+        } else {
+            os_unmap(p, kPageSize, kPageSize);
+        }
+    }
 
     [[nodiscard]] page* new_page(int cls) noexcept {
         // Reuse the retained empty page for this class if we have one — no
@@ -354,7 +386,7 @@ struct heap {
             partial[cls] = c;
             return c;
         }
-        void* mem = os_map_aligned(kPageSize, kPageSize);
+        void* mem = take_raw_page();
         if (JET_UNLIKELY(!mem)) return nullptr;
         auto* pg = static_cast<page*>(mem);
         const std::size_t bs = g_sizes.sizes[cls];
@@ -487,9 +519,10 @@ JET_ALWAYS_INLINE void raw_deallocate(void* p, std::size_t bytes, std::size_t al
                 while (*pp && *pp != pg) pp = &(*pp)->next;
                 if (*pp == pg) *pp = pg->next;
                 // Retain ONE empty page per class as a syscall-free reserve;
-                // hand memory back to the OS only when the reserve is full.
+                // hand overflow to the cross-class page pool (still committed,
+                // reused with zero syscall) before ever touching the OS.
                 if (h->cached[pg->cls] == nullptr) h->cached[pg->cls] = pg;
-                else os_unmap(pg, kPageSize, kPageSize);
+                else h->give_raw_page(pg);
             }
         }
         return;
@@ -907,9 +940,10 @@ private:
     return pg->block_size;
 }
 
-// Release this thread's retained empty slab pages back to the OS. Cheap, safe
-// to call any time; a no-op when there is nothing cached. Call it on threads
-// that have finished a burst of allocation to shrink RSS.
+// Release this thread's retained empty slab pages back to the OS: both the
+// per-class reserve AND the cross-class page pool. Cheap, safe to call any
+// time; a no-op when there is nothing parked. Call it on threads that have
+// finished a burst of allocation to shrink RSS back to the live set.
 inline void trim() noexcept {
     detail::heap* h = detail::t_heap;
     for (std::size_t c = 0; c < detail::kNumClasses; ++c) {
@@ -918,6 +952,13 @@ inline void trim() noexcept {
             detail::os_unmap(pg, detail::kPageSize, detail::kPageSize);
         }
     }
+    // Drain the cross-class committed-page pool.
+    while (h->pool) {
+        void* p = h->pool;
+        h->pool = *static_cast<void**>(p);
+        detail::os_unmap(p, detail::kPageSize, detail::kPageSize);
+    }
+    h->pool_n = 0;
 }
 
 }  // namespace jet
