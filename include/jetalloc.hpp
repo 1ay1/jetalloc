@@ -531,8 +531,15 @@ struct heap {
 // address of the thread_local object once (and caching it) lets the hot path
 // avoid the general TLS-access sequence on every allocation — the compiler
 // keeps `t_heap` in a register across a run of allocations.
-inline thread_local heap  t_heap_storage{};
-inline thread_local heap* t_heap = &t_heap_storage;
+// Per-thread heap storage, reached through an always-inline accessor. We take
+// the address of the thread_local object at each use; the compiler still keeps
+// it in a register across a run of allocations, but there is NO dynamically-
+// initialised `thread_local pointer` — that would emit a per-TU TLS-init
+// function and cause "multiple definition" links when several TUs include this
+// header (an ODR hazard on MinGW in particular). `cur_heap()` is constant-
+// initialised: just `&` of the TLS object, zero init cost.
+inline thread_local heap t_heap_storage{};
+[[nodiscard]] JET_ALWAYS_INLINE heap* cur_heap() noexcept { return &t_heap_storage; }
 
 // A registry of large (direct) allocations so we can recognise + size them.
 // `magic` lets usable_size distinguish a large block from an interior slab
@@ -543,7 +550,7 @@ struct large_hdr { std::uint64_t magic; void* os_base; std::size_t map_bytes; st
 [[nodiscard]] JET_ALWAYS_INLINE void* raw_allocate(std::size_t bytes, std::size_t align) noexcept {
     if (JET_UNLIKELY(bytes == 0)) bytes = 1;
     if (JET_LIKELY(bytes <= kMaxSmall && align <= alignof(std::max_align_t)))
-        return t_heap->alloc_small(class_of(bytes));
+        return cur_heap()->alloc_small(class_of(bytes));
     // Large / over-aligned: direct-map, then carve an ALIGNED user pointer
     // with the header stored in the bytes immediately below it.
     const std::size_t map_align = align < kPageSize ? kPageSize : align;
@@ -578,7 +585,7 @@ JET_ALWAYS_INLINE void raw_deallocate(void* p, std::size_t bytes, std::size_t al
     // Cross-thread free: the block belongs to another thread's heap. Do NOT
     // touch any owner-private state (that would be a data race). Push it onto
     // the page's lock-free MPSC remote-free stack; the owner reclaims it later.
-    if (JET_UNLIKELY(pg->owner != t_heap)) {
+    if (JET_UNLIKELY(pg->owner != cur_heap())) {
         void* head = pg->remote_free.load(std::memory_order_relaxed);
         do { *static_cast<void**>(p) = head; }
         while (!pg->remote_free.compare_exchange_weak(
@@ -1062,7 +1069,7 @@ private:
 // time; a no-op when there is nothing parked. Call it on threads that have
 // finished a burst of allocation to shrink RSS back to the live set.
 inline void trim() noexcept {
-    detail::heap* h = detail::t_heap;
+    detail::heap* h = detail::cur_heap();
     for (std::size_t c = 0; c < detail::kNumClasses; ++c) {
         if (detail::page* pg = h->cached[c]) {
             h->cached[c] = nullptr;
@@ -1076,6 +1083,34 @@ inline void trim() noexcept {
         detail::os_unmap(p, detail::kPageSize, detail::kPageSize);
     }
     h->pool_n = 0;
+}
+
+// A snapshot of THIS thread's heap occupancy. Computed on demand by walking the
+// thread's own page lists — there are no counters on the hot path, so calling
+// stats() costs nothing until you ask. Cross-thread blocks parked for reclaim
+// are not double-counted (they still belong to the owning page's `used`).
+struct stats_t {
+    std::size_t bytes_live    = 0;  // bytes currently handed out (used * block_size)
+    std::size_t bytes_mapped  = 0;  // slab bytes mapped for this thread
+    std::size_t pages_active  = 0;  // slab pages with ≥ 1 live block
+    std::size_t pages_cached  = 0;  // empty pages retained as reserve (per-class + pool)
+};
+
+[[nodiscard]] inline stats_t stats() noexcept {
+    detail::heap* h = detail::cur_heap();
+    stats_t s;
+    for (std::size_t c = 0; c < detail::kNumClasses; ++c) {
+        for (detail::page* pg = h->partial[c]; pg; pg = pg->next) {
+            s.bytes_live   += std::size_t(pg->used) * pg->block_size;
+            s.bytes_mapped += detail::kPageSize;
+            if (pg->used) ++s.pages_active;
+            else          ++s.pages_cached;
+        }
+        if (h->cached[c]) { ++s.pages_cached; s.bytes_mapped += detail::kPageSize; }
+    }
+    s.pages_cached += h->pool_n;
+    s.bytes_mapped += std::size_t(h->pool_n) * detail::kPageSize;
+    return s;
 }
 
 // ════════════════════════════════════════════════════════════════════════
