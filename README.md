@@ -1,221 +1,270 @@
 # jetalloc
 
-**A fast, modern, drop-in memory allocator.**
+**A header-only, type-theoretic, memory-safe allocator for modern C++.**
 
-jetalloc is a small (~700 LOC) thread-caching allocator in the mimalloc / tcmalloc
-family: per-thread heaps, page-based slabs with **no per-object header**, sharded
-free lists so the same-thread `malloc`/`free` fast paths touch **zero atomics and
-zero locks**, and a lock-free MPSC stack for cross-thread frees.
+One header. No `.c`, no assembly, no linking, no global `operator new`
+interposition. `#include <jetalloc.hpp>` and go. Under the hood it is a fast
+slab allocator (per-thread heaps, 64 KiB header-free slab pages, size-class free
+lists). On the surface it is something rarer: an allocator whose **C++ type
+system makes memory bugs unrepresentable**.
 
-It is a **drop-in replacement**: link it, or `LD_PRELOAD` it, and your program's
-`malloc`/`free`/`new`/`delete` route through jetalloc — no code changes.
-
-## Why
-
-Because a system allocator upgrade should never break your binary. jetalloc is
-self-contained (no external dependency, no fragile global `free()` interposition
-that crashes during C++ locale init), and it's *fast* — measured head-to-head
-against the fastest production allocators through the **identical** drop-in
-`malloc`/`free` interface (`LD_PRELOAD`), median of 9 runs on a 12-core
-Alder Lake (i5-12400F) box:
-
-| Workload (Mops/s, higher = better) | jetalloc | tcmalloc | mimalloc | jemalloc | glibc |
-|------------------------------------|---------:|---------:|---------:|---------:|------:|
-| **small-fixed (32 B loop)**        | **311** 🏆 |    287   |    261   |    249   |  230  |
-| **mixed-size (8 B–4 KiB)**          | **188** 🏆 |    152   |     62   |    103   |   17  |
-| **threaded (8 threads, same-thread)** | **1303** 🏆 | 1209   |    943   |   1050   | 1305  |
-| producer/consumer (cross-thread)   |    145   |     22   |     76   |  **208** |   12  |
-
-**Honest scorecard.** jetalloc wins **three of the four**: small-fixed,
-mixed-size (1.2× tcmalloc, 3.0× mimalloc, 11× glibc — the most realistic churn
-workload) and threaded. Small-fixed used to be its weakest row, trailing
-tcmalloc; fusing each size class's free-list head and count into a single
-cache-line-resident bin (`jet_bin`) took it from 282 to 311 Mops/s and put it in
-first place.
-
-On cross-thread producer/consumer it is a clear **#2** — 6.6× tcmalloc and 1.9×
-mimalloc — with jemalloc ahead. This gap is **structural, and understood**: the
-workload is one thread that only allocates and another that only frees, so every
-block is born on the producer's core and dies on the consumer's. jetalloc's
-design routes every freed block back to its owning page, so the producer
-re-hands-out memory the *consumer* last touched — a cross-core cache-line
-transfer per reused block (instrumented: only ~46% of allocations reuse a warm
-block; the rest re-bump a page whose blocks went cold on the other core).
-jemalloc keeps freed blocks in the freeing thread's own cache, trading that
-transfer for weaker home-thread locality. The pure cache-line-transfer ceiling
-for this access pattern measures ~300 Mops/s on this box, so both allocators sit
-well under a hardware wall that no per-object cleverness removes; closing the
-rest would mean abandoning the owner-routing model that wins the other three
-workloads. See `docs/FAST.md` for the full instrumented analysis.
-
-On `threaded`, glibc and jetalloc are inside run-to-run noise; that workload is
-dominated by the benchmark's own memory traffic rather than by allocator logic.
-
-Reproduce it yourself: `./bench/compare.sh 9`. For cycle-level profiling of the
-drop-in hot paths (rdtsc, median-of-N), `bench/jet_cycles.c`.
-
-*(GCC/Clang, x86-64. Numbers vary by CPU; the harness runs the same binary under
-each allocator so the delta is purely the allocator. The threaded benchmark runs
-40M ops/thread — at the original 5M it finished in 0.03 s and measured thread
-startup rather than the allocator.)*
-
-## Design
-
-- **Thread-local heaps.** Each thread owns its pages. The alloc fast path is a
-  single free-list pop; the free fast path is a single push. No atomics on the
-  common same-thread path.
-- **Per-class thread cache (fast bins).** In front of the pages, each heap keeps
-  a small LIFO of recycled blocks per size class (like glibc's tcache /
-  mimalloc's thread free list). Most `malloc`/`free` pairs hit the bin and never
-  touch page bookkeeping at all; surplus is flushed back to pages in batches.
-- **Bump allocation.** A fresh page hands out its never-used blocks by pure
-  pointer arithmetic (`bump += size`) — no up-front freelist threading, so a new
-  page dirties only the cache lines it actually serves.
-- **64 KiB slab pages, header-free blocks.** A block's owning page is recovered
-  by masking its address (`ptr & ~(64KiB-1)`), so blocks carry no bookkeeping
-  bytes — denser cache lines than a classic sized-header malloc.
-- **Sharded free lists** (the mimalloc trick). Each page has a `local_free`
-  (owner-thread frees, no atomics) and an atomic `thread_free` (cross-thread
-  frees, lock-free Treiber stack). The owner drains `thread_free` lazily, so
-  neither hot path pays for the cross-thread case it isn't hitting.
-- **Batched cross-thread free (snmalloc message passing).** A free of another
-  thread's block is *not* pushed to the owner one-at-a-time. Each thread buffers
-  remote frees in a local cache bucketed by target heap, then flushes each
-  bucket as **one batch with a single atomic CAS** onto the owner's inbox. The
-  owner reclaims its whole inbox in one atomic-exchange. Thousands of
-  cross-thread frees cost one atomic *per batch*, not per object — this is why
-  jetalloc runs the producer/consumer workload **4.6× faster than glibc** (which
-  locks on every cross-thread free). A thread-exit destructor flushes any
-  buffered frees so nothing is ever stranded.
-- **39 size classes**, ≤ 12.5 % internal fragmentation, O(1) size→class map.
-- **Large allocations** (> 32 KiB) go straight to `mmap`, page-aligned, with a
-  one-page header so `free` / `usable_size` / `owns` are O(1).
-- **Crash-proof interposition.** `free()` consults `jet_owns()` and forwards
-  foreign pointers to the real libc `free` — so replacing the system allocator
-  can't corrupt the heap on a pointer jetalloc didn't hand out. `jet_owns()` is
-  hardened to return safely (never dereference unmapped memory) on *any* input:
-  foreign heap/stack addresses, page-aligned pointers that resemble a large
-  block, and already-freed large mappings are all rejected without a crash,
-  including in the arena-disabled fallback. Regression-locked under ASan/UBSan.
-
-## Build
-
-```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-ctest --test-dir build          # 5 suites: C, C++, mt, cross-thread, large-mt
-./build/jet_bench               # jetalloc numbers
-./build/jet_bench_system        # system-allocator baseline
-```
-
-## Use
-
-**Explicit API** (`#include <jetalloc.h>`, link `libjetalloc.a`):
-
-```c
-void* p = jet_malloc(128);
-jet_free(p);
-```
-
-**Whole-program C++ override** — link the static lib; every `new`/`delete`
-(and internal `malloc`) routes through jetalloc:
-
-```sh
-cc myapp.c  -ljetalloc
-c++ myapp.cpp -ljetalloc
-```
-
-**Zero-recompile, any program** — preload the shared lib:
-
-```sh
-LD_PRELOAD=./build/libjetalloc.so  ./your_program
-```
-
-**Modern C++** (`#include <jetalloc.hpp>`, C++17 or newer; targets C++23 and
-degrades gracefully) — an idiomatic `jet::` skin over the C ABI. You rarely
-need it: once linked, `new` / `make_unique` / every `std::` container is
-already on jetalloc. Reach for the header when you want to touch the allocator
-*explicitly* — RAII page reclamation, a container bound to jetalloc by type,
-or a `std::pmr` resource:
+The bar it sets for itself is simple — *a Rust programmer should look at the API
+and recognise the guarantees.*
 
 ```cpp
 #include <jetalloc.hpp>
+using namespace jet;
 
-// RAII: hand freed pages back to the OS when the scope ends (even on throw).
-void handle(const Request& r) {
-    jet::scoped_trim _;
-    // ... transient allocation ...
-}
-
-// A std-conformant allocator that binds storage to jetalloc BY TYPE —
-// jet::owns(v.data()) is then true regardless of how the program linked.
-std::vector<int, jet::allocator<int>> v;      // or: jet::vector<int>
-jet::string s;                                 // basic_string on jetalloc
-
-// unique_ptr whose object lives on jetalloc storage (empty deleter → the
-// unique_ptr stays pointer-sized). Strongly exception-safe.
-auto up = jet::allocate_unique<Widget>(args...);
-
-// A std::pmr::memory_resource backed by jetalloc.
-std::pmr::vector<std::pmr::string> pv{jet::memory_resource()};
-
-// Typed introspection.
-jet::stats_t st = jet::stats();               // st.pages_active, st.bytes_live, ...
+auto p = make<int>(42);        // owned<int> — affine, RAII, provably ours
+auto r = p.borrow();           // ref<int>  — &int   (shared, many allowed)
+auto m = p.borrow_mut();       //            — &mut   ✗ PANICS: r is still live
+// ... p's destructor frees. No delete. No double free. No leak. No UAF.
 ```
 
-## API
+## Why
 
-```c
-void*  jet_malloc(size_t);
-void   jet_free(void*);
-void*  jet_calloc(size_t, size_t);
-void*  jet_realloc(void*, size_t);
-void*  jet_aligned_alloc(size_t align, size_t size);
-int    jet_posix_memalign(void**, size_t align, size_t size);
-void   jet_free_sized(void*, size_t);      /* fast path for C++ sized delete */
-size_t jet_usable_size(const void*);
-int    jet_owns(const void*);              /* is this pointer ours? O(1)     */
-void   jet_get_stats(jet_stats*);          /* build with -DJET_STATS         */
+A `malloc`/`free` interface can be *fast*, but it can never be *safe*: it hands
+you a `void*` and trusts you to free it once, with the right size, and never
+touch it again. Those are runtime obligations the compiler cannot see.
+
+jetalloc lifts every one of those obligations into a **type**, so the compiler
+(or, where the language can't express the check statically, a single defined
+runtime trap) enforces it — the heap is never left to corrupt.
+
+| Rust concept | jetalloc encoding |
+|---|---|
+| Ownership / `Drop` | `owned<T>` / `owned_array<T>` — **affine** (move-only) RAII handles. No copy ctor ⇒ **no double free**. Move nulls the source ⇒ **no use-after-move**. Destructor drops ⇒ **no leak**. |
+| `&T` (shared borrow) | `ref<T>` — read-only, copyable, many allowed. |
+| `&mut T` (unique borrow) | `mut<T>` — exclusive, move-only, at most one. |
+| Aliasing XOR (`&` many **xor** `&mut` one) | enforced by a per-object **borrow ledger**: a violation is a loud `panic()`, never UB — the borrow checker, done dynamically with identical semantics. |
+| Lifetimes | a borrow pins its owner; dropping an owner with a live borrow **panics** (dangling-borrow trap). |
+| `Result<T, E>` | `expected<owned<T>, alloc_error>` — OOM is a **value**; `[[nodiscard]]` forces you to handle it. |
+| `&[T]` (bounded slice) | `owned_array<T>` yields a `std::span`; `.at()` is bounds-checked. |
+| provenance | you **cannot** build an `owned<T>` from a raw pointer — the only mint site is the allocator, so "did jetalloc allocate this?" is a **theorem**, not a runtime query. |
+
+## The guarantees, and how each is enforced
+
+- **Double free** — impossible. `owned<T>` has a deleted copy constructor; there
+  is no second handle to free through.
+- **Use-after-move** — a moved-from handle is null; its destructor is a no-op
+  and any borrow attempt panics.
+- **Use-after-free** — freeing consumes the handle by value; there is no name
+  left to dereference.
+- **Wrong-size free** — the element count lives *in* the handle, so the sized
+  free is computed, never passed.
+- **Buffer overrun** — array elements are reached only through a bounded
+  `std::span` or a checked `.at()`; raw pointer arithmetic is not exposed.
+- **Bad alignment** — alignment is a compile-time `power_of_two<N>` proof;
+  `power_of_two<48>` does not instantiate.
+- **Data race on a single object** — the aliasing-XOR borrow ledger forbids a
+  `&mut` coexisting with any `&`.
+- **Silent OOM** — the primary API returns `jet::result<…>` (`std::expected`);
+  the throwing `make<…>` sits on top for callers who prefer exceptions.
+- **Leak** — every handle is RAII; there is no manual free to forget.
+
+The dangerous operations don't merely fail at runtime — **they don't compile.**
+The test suite proves it: `test/neg/` contains programs that *must* fail to
+compile, and CTest asserts the compiler rejects each one.
+
+```
+$ ctest --output-on-failure
+1/4 jet_test ............   Passed     # runtime behaviour + static_assert proofs
+2/4 neg_double_free .....   Passed     # copying an owned<T> does not compile
+3/4 neg_wrong_align .....   Passed     # power_of_two<48> does not compile
+4/4 neg_copy_owned ......   Passed     # copying a &mut does not compile
+100% tests passed
 ```
 
-## Tuning
+## API tour
 
-Every knob has a sane default; the allocator needs no configuration.
+```cpp
+using namespace jet;
 
-**Runtime env vars** (read once at library load, for experiments and atypical
-hardware):
+// ── single objects ───────────────────────────────────────────────────────
+result<owned<Widget>> w = try_make<Widget>(args...);   // OOM as a value
+owned<Widget> x = make<Widget>(args...);               // or throwing
 
-| Env var | Default | Effect |
-|---------|--------:|--------|
-| `JET_NUMA` | on if >1 node | First-touch NUMA-local span binding via `mbind`. Self-disables to a single branch on single-node machines; `JET_NUMA=0` forces off. |
-| `JET_PERCPU` | off | Opt-in rseq per-CPU cache (`src/jet_rseq.S`). A win only at very high core counts (64–128+); breaks even or regresses the single-thread fast path here. |
-| `JET_PLACE` | off | Research: address-routed, owner-oblivious cross-thread free. Correct but not faster than the batched engine on this box. |
+x.with_mut([](Widget& w){ w.tick(); });                // scoped &mut
+int v = x.with([](const Widget& w){ return w.value; });// scoped &
 
-**Compile-time `#define`s** (in `src/jet_internal.h` / `src/jet_central.c`):
+// ── arrays (bounded) ─────────────────────────────────────────────────────
+auto a = make_array_with<int>(5, [](std::size_t i){ return int(i*i); });
+for (int n : a.view()) use(n);        // std::span, no raw pointer escapes
+int last = a.at(4);                   // bounds-checked; a.at(5) throws
 
-| Macro | Default | Effect |
-|-------|--------:|--------|
-| `JET_TCACHE_BYTES` | 1 MiB | Per-class fast-bin byte budget; each bin caps at `bytes / class_size` clamped to [8, 1024]. 1 MiB is the measured knee. |
-| `JET_REMOTE_FLUSH` | 256 | Blocks buffered per target heap before a cross-thread free batch is posted (one atomic CAS per batch). |
-| `JET_SHARED_HOT` | 8 | Cross-thread-free score at which a size class is reclassified "shared-hot" and allowed a larger outgoing batch. |
-| `JET_SHARED_HOT_BYTES` | 2 MiB | Byte budget for a shared-hot class's outgoing batch (bounds stranded memory); measured optimum. |
-| `JET_COLORS` | 16 | Cache-coloring steps for consecutive same-class slabs (anti L1-set-conflict). Always on; zero hot-path cost. |
+// ── raw bytes, still bounded + affine ────────────────────────────────────
+auto buf = buffer::make(4096);                    // std::span<std::byte>
+auto aln = buffer::make(256, power_of_two<64>{}); // over-aligned, proven
 
-See `docs/FAST.md` for the full instrumented rationale behind each — including
-the ones measured, documented, and deliberately left **off** by default.
+// ── drop-in std allocator ────────────────────────────────────────────────
+std::vector<int, jet::allocator<int>> vec;        // container uses jetalloc
+```
 
-## Status
+## Using it
 
-Correct (100 % of the test suite — C, C++, an 8-thread cross-thread-free stress,
-and a multithreaded large-allocation stress; TSan + ASan/UBSan clean on the
-concurrent paths, including the `JET_PLACE=1` / `JET_PERCPU=1` modes) and, through the
-identical `LD_PRELOAD` drop-in interface, **the fastest of the five allocators
-measured on three of four workloads** (small-fixed, mixed-size, threaded), and a
-clear #2 behind jemalloc on cross-thread producer/consumer — a gap that is
-structural and documented, not a missing optimisation (`docs/FAST.md`).
+Header-only — vendor the header, or link the CMake INTERFACE target:
 
-Build with `-DJET_STATS=1` for live `jet_get_stats` counters (off by default so
-the hot path stays atomic-free), or `-DJET_DEBUG` for internal invariant checks.
+```cmake
+add_subdirectory(jetalloc)
+target_link_libraries(your_app PRIVATE jetalloc::jetalloc)  # adds the include + C++23
+```
+
+Requires **C++23** (`std::expected`, `std::span`, concepts, `consteval`). To
+disable the runtime borrow/contract checks in a hardened release build, compile
+with `-DJET_NO_CONTRACTS` (you keep every *compile-time* guarantee; you lose
+only the dynamic aliasing/dangling traps).
+
+## Cross-platform, native speed everywhere
+
+jetalloc talks to the OS through **one virtual-memory layer**, and every
+platform branch is resolved at **compile time** (a single `#if`) so there is
+zero portability overhead in the emitted code:
+
+| Platform | Page source | Notes |
+|---|---|---|
+| Windows | `VirtualAlloc` / `VirtualFree` | 64 KiB allocation granularity == our slab-page size, so pages come back aligned with **no copy**. Only the two kernel32 entry points are declared — `<windows.h>` is never included. |
+| Linux / macOS / *BSD / Haiku | `mmap` / `munmap` | slab pages come **straight from the kernel** — no libc-malloc arena in the middle, so jetalloc neither depends on nor contends with another allocator. `mmap` has no portable aligned variant, so we over-map by the alignment and `munmap` the head/tail slack (the jemalloc/mimalloc technique); large regions get a best-effort `MADV_HUGEPAGE` hint on Linux. |
+| Anything else (freestanding) | `malloc` + align | portable fallback; still correct, just an extra pointer of bookkeeping. |
+
+The hot path is tuned for the microarchitecture, portably: `[[likely]]`/branch
+hints steer the predictor toward the same-thread fast path, the fast path is
+`always_inline`, and the per-thread heap is reached through a cached
+`thread_local` pointer so a run of allocations keeps it in a register. Slab
+pages are **header-free** — a block's owning page is recovered by masking its
+address — so same-thread `alloc`/`free` are a branchless pop/push on a
+free list. The result is the same class of allocator as mimalloc/tcmalloc,
+but header-only and memory-safe by construction.
+
+### Speed, in the design
+
+Every step of the fast path was engineered to be O(1) and syscall-free:
+
+- **size → class** is a shift + one byte-table load (no division, no loop).
+- **allocation** pops a free list or bumps a pointer — no page-list scan, because
+  full pages are unlinked the instant they fill, so the list head is always
+  allocatable.
+- **page geometry** (data start, capacity) is computed once when a page is
+  created, never on the hot path.
+- **one empty page per size class is retained** as a reserve, so an alloc/free
+  churn loop never touches the OS.
+- **`owned<T>` is a single allocation** — the borrow ledger is co-located with
+  the object in the same block (and vanishes entirely under `-DJET_NO_CONTRACTS`).
+
+Measured with `bench/jet_bench.cpp` (`-O2`, jetalloc vs. the platform allocator
+through the identical typed interface; Mops/s, higher = better):
+
+| Workload | jetalloc | system malloc | speedup |
+|---|---:|---:|---:|
+| small-fixed (32 B) | **114** | 15 | **7.5×** |
+| mixed-size (8 B–4 KiB) | **20** | 8 | **2.5×** |
+
+(Windows / UCRT, single core. Absolute numbers vary by machine; the ratio is the
+point — and it holds because the wins above are structural, not micro-tuning.)
+
+## Thread safety
+
+jetalloc is **fully thread-safe** and lock-free on the hot path. Each thread
+owns a private heap; a page belongs to exactly one heap.
+
+- **Same-thread `alloc`/`free`** touch only owner-private state — **zero atomics,
+  zero locks**.
+- **Cross-thread `free`** (you allocate on thread A, free on thread B — the
+  norm for thread pools, work queues, and any container moved across threads)
+  is handled the mimalloc/snmalloc way: the block is pushed onto the page's
+  **lock-free MPSC `remote_free` stack** with a single `compare_exchange`, and
+  the owning thread reclaims it lazily. No owner-private state is ever mutated
+  from a foreign thread, so there is **no data race** — verified by a 4×4
+  producer/consumer stress test (`test/jet_test_mt.cpp`) and clean under
+  ThreadSanitizer in CI.
+
+## Introspection & maintenance
+
+```cpp
+jet::version();               // "0.3.0"
+jet::usable_size(p);          // real block size for a jetalloc pointer
+jet::trim();                  // return this thread's cached empty pages to the OS
+```
+
+## Production status
+
+- **Thread-safe**, including the cross-thread-free path (lock-free).
+- **No leaks / no UB**: CI runs the full suite under AddressSanitizer +
+  UndefinedBehaviorSanitizer and ThreadSanitizer on every push.
+- **CI matrix**: Linux (GCC), macOS (Clang), Windows (MSVC), Debug + Release.
+- **Guarantees are tested**: `test/neg/` contains programs that *must fail to
+  compile*, and CTest asserts the compiler rejects each.
+- **Semantic versioning** via `JETALLOC_VERSION_*` macros.
+
+### Known limitations (honest)
+
+- **Not a global `malloc` replacement.** This is an explicit, typed API; it does
+  **not** interpose the system `operator new`/`malloc`. Use `jet::allocator<T>`
+  for containers, the `owned<>`/`buffer` handles for objects.
+- **Pages are returned to the OS conservatively** — one empty page per size
+  class is retained per thread as a reserve; the rest are released on
+  `free` or explicit `jet::trim()`. Long-lived threads with spiky allocation
+  should call `trim()` after a burst to shrink RSS.
+- **The dynamic borrow checker is single-object**: it enforces aliasing-XOR on
+  one `owned<T>` at a time, not a whole-program lifetime graph. It catches the
+  common mistakes at a defined trap; it is not a substitute for a static
+  borrow checker across threads.
+- **Per-platform verification status.** Every branch is compile-time selected,
+  so exactly one OS path is emitted per build. The Windows (`VirtualAlloc`)
+  path is exercised locally on every change; the POSIX (`mmap`) and
+  freestanding paths are validated by the CI matrix (Linux/macOS/Windows ×
+  Debug/Release, plus ASan/UBSan/TSan). If you build on an untested Unix
+  variant, run `ctest` first — the negative-compile and cross-thread-free
+  proofs are the same everywhere.
+
+## Concurrency where thread bugs don't compile (`jetalloc_sync.hpp`)
+
+The allocator is thread-safe internally; the companion header
+`<jetalloc_sync.hpp>` goes further and makes the *caller's* concurrency bugs
+unrepresentable, by lifting the rules Rust enforces in its compiler into C++
+concepts and types.
+
+```cpp
+#include <jetalloc_sync.hpp>
+using namespace jet;
+
+// Data lives INSIDE the lock. There is no API that yields a bare `T&`, so
+// "touch shared state without the lock" is not an expressible program.
+guarded<std::vector<int>> shared;
+shared.with([](auto& v){ v.push_back(1); });      // the only way in
+
+// Structured threads: args must be `sendable`, the body can't leak an
+// exception into std::terminate, and the thread joins on scope exit.
+{
+    scoped_thread worker([](owned<int> x){ /* owns x */ }, make<int>(7));
+}   // <- joined here, automatically
+
+// Ownership hand-off with no aliasing — the value MOVES across the boundary.
+channel<owned<Job>> jobs;
+jobs.send(make<Job>(...));                        // sender no longer owns it
+```
+
+| Bug | Encoding | Caught |
+|---|---|---|
+| **Data race on shared state** | `guarded<T>` — T reachable only through a move-only, `[[nodiscard]]` lock guard | structurally: no bare `T&` exists |
+| **Sharing a thread-unsafe type** | `sendable` / `shareable` concepts gate `scoped_thread` args | **compile error** at the spawn site |
+| **Deadlock (ABBA lock order)** | `guarded<T, Rank>` + `assert_lock_order<Outer, Inner>()` | **compile error** (same scope) / debug tripwire (across functions) |
+| **Aliasing lock ownership** | the lock guard is move-only, non-copyable | **compile error** |
+| **Forgotten join / detached-thread `terminate`** | `scoped_thread` joins on destruction; body wraps exceptions | structurally unreachable |
+| **Use-after-move of a sent value** | `channel::send` / `scoped_thread` take by move; the source is emptied | affine handle: no name left |
+
+These are proved by `test/neg/{non_send_thread,copy_guard,bad_lock_order}.cpp`
+— programs that **must fail to compile**, asserted by CTest.
+
+### The honest boundary (what a library *cannot* prove at compile time)
+
+C++ has no borrow checker in the language. Exactly **one** class of bug — a
+reference into `guarded` data *outliving* its lock guard — cannot be rejected
+purely at compile time by a library, because that needs whole-program lifetime
+analysis that only a compiler (Rust's) can do. We make it as hard as the
+language allows (the guard is `[[nodiscard]]`, move-only, and is the sole path
+to the data) and catch the residue with a debug tripwire. **Everything else on
+the table above is a genuine compile-time guarantee** — we don't claim more than
+the type system actually delivers.
 
 ## License
 

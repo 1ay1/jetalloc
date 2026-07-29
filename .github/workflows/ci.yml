@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  # Build + full test suite (runtime, negative-compile, multithreaded) on the
+  # three tier-1 platforms and both major compilers, Debug and Release.
+  test:
+    name: ${{ matrix.os }} / ${{ matrix.cxx }} / ${{ matrix.build_type }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        build_type: [Debug, Release]
+        include:
+          - os: ubuntu-latest
+            cxx: g++
+          - os: macos-latest
+            cxx: clang++
+          - os: windows-latest
+            cxx: cl
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+        env:
+          CXX: ${{ matrix.cxx }}
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+      - name: Test
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
+
+  # Run the test suite under sanitizers on Linux (clang) — proves no leaks, no
+  # UB, and no data races on the cross-thread free path.
+  sanitizers:
+    name: sanitizers / ${{ matrix.san }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        san: ["address,undefined", "thread"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DJET_SANITIZE=${{ matrix.san }}
+        env:
+          CXX: clang++
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1
