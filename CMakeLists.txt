@@ -81,6 +81,12 @@ if(JET_IS_TOPLEVEL)
     target_link_libraries(jet_bench PRIVATE jetalloc)
     target_compile_options(jet_bench PRIVATE
         $<$<AND:$<CONFIG:Release>,$<CXX_COMPILER_ID:GNU,Clang,AppleClang>>:-O2>)
+
+    # Guided tour: a runnable, self-narrating demo of every guarantee.
+    #     cmake --build build --target jet_tour && ./build/jet_tour
+    add_executable(jet_tour examples/tour.cpp)
+    target_link_libraries(jet_tour PRIVATE jetalloc)
+    add_test(NAME jet_tour COMMAND jet_tour)
 endif()
 
 # ── Install (top-level only) ─────────────────────────────────────────────────

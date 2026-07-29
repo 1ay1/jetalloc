@@ -1,25 +1,68 @@
-# jetalloc
+<div align="center">
 
-**A header-only, type-theoretic, memory-safe allocator for modern C++.**
+```
+       ██╗███████╗████████╗ █████╗ ██╗     ██╗      ██████╗  ██████╗
+       ██║██╔════╝╚══██╔══╝██╔══██╗██║     ██║     ██╔═══██╗██╔════╝
+       ██║█████╗     ██║   ███████║██║     ██║     ██║   ██║██║
+  ██   ██║██╔══╝     ██║   ██╔══██║██║     ██║     ██║   ██║██║
+  ╚█████╔╝███████╗   ██║   ██║  ██║███████╗███████╗╚██████╔╝╚██████╗
+   ╚════╝ ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚══════╝ ╚═════╝  ╚═════╝
+```
 
-One header. No `.c`, no assembly, no linking, no global `operator new`
-interposition. `#include <jetalloc.hpp>` and go. Under the hood it is a fast
-slab allocator (per-thread heaps, 64 KiB header-free slab pages, size-class free
-lists). On the surface it is something rarer: an allocator whose **C++ type
-system makes memory bugs unrepresentable**.
+### the allocator where memory bugs don't compile
 
-The bar it sets for itself is simple — *a Rust programmer should look at the API
-and recognise the guarantees.*
+**A header-only, type-theoretic, memory-safe *and* thread-safe allocator for modern C++.**
+
+![C++23](https://img.shields.io/badge/C%2B%2B-23-00599C?logo=c%2B%2B&logoColor=white)
+![header-only](https://img.shields.io/badge/header--only-2%20files-success)
+![license](https://img.shields.io/badge/license-MIT-blue)
+![platforms](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows%20%C2%B7%20BSD-lightgrey)
+![deps](https://img.shields.io/badge/dependencies-0-brightgreen)
+
+</div>
+
+---
+
+**Two headers. No `.c`, no assembly, no linking, no dependencies.** `#include <jetalloc.hpp>`
+and go. Under the hood it's a fast slab allocator — per-thread heaps, 64 KiB
+header-free slab pages, lock-free size-class free lists, pages straight from the
+kernel. On the *surface* it's something rarer: an allocator whose **C++ type
+system makes memory bugs unrepresentable**, backed by a proof suite that asserts
+the unsafe programs *fail to compile*.
+
+The bar it sets for itself is one sentence: *a Rust programmer should read the
+API and recognise the guarantees.* Then find out they're enforced without a
+borrow checker in the language — by the type system alone.
 
 ```cpp
 #include <jetalloc.hpp>
 using namespace jet;
 
-auto p = make<int>(42);        // owned<int> — affine, RAII, provably ours
-auto r = p.borrow();           // ref<int>  — &int   (shared, many allowed)
-auto m = p.borrow_mut();       //            — &mut   ✗ PANICS: r is still live
+auto p = make<int>(42);        // owned<int>  — affine, RAII, provably ours
+auto r = p.borrow();           // ref<int>    — &int   (shared, many allowed)
+auto m = p.borrow_mut();       //             — &mut   ✗ PANICS: r is still live
 // ... p's destructor frees. No delete. No double free. No leak. No UAF.
+
+owned<int> q = std::move(p);   // p is now null — moved-from, statically dead
+int bad = *p;                  // ✗ won't compile: owned<T> has no operator*
 ```
+
+### The bug that doesn't compile
+
+```cpp
+owned<int> a = make<int>(1);
+owned<int> b = a;              // ← this line does not compile.
+```
+```
+error: use of deleted function 'jet::owned<int>::owned(const owned<int>&)'
+        owned<int> b = a;
+                       ^
+note: 'owned' is affine — copying it would create a second owner, i.e. a double free.
+```
+
+That's not a lint or a runtime check. It is the C++ type system refusing to
+represent a second owner. The whole library is built this way: **the mistake has
+no syntax.**
 
 ## Why
 
@@ -68,12 +111,32 @@ compile, and CTest asserts the compiler rejects each one.
 
 ```
 $ ctest --output-on-failure
-1/4 jet_test ............   Passed     # runtime behaviour + static_assert proofs
-2/4 neg_double_free .....   Passed     # copying an owned<T> does not compile
-3/4 neg_wrong_align .....   Passed     # power_of_two<48> does not compile
-4/4 neg_copy_owned ......   Passed     # copying a &mut does not compile
+ jet_test .............   Passed   # runtime behaviour + static_assert proofs
+ jet_test_mt ..........   Passed   # 4×4 producer/consumer cross-thread-free stress
+ jet_test_sync ........   Passed   # concurrency guarantees (guarded / channel)
+ neg_double_free ......   Passed   # copying an owned<T> does NOT compile
+ neg_wrong_align ......   Passed   # power_of_two<48> does NOT compile
+ neg_copy_owned .......   Passed   # copying a borrow does NOT compile
+ neg_non_send_thread ..   Passed   # sending a !Send type to a thread does NOT compile
+ neg_copy_guard .......   Passed   # copying a lock guard does NOT compile
+ neg_bad_lock_order ...   Passed   # taking locks out of rank order does NOT compile
+ jet_tour .............   Passed   # the guided demo runs clean
 100% tests passed
 ```
+
+## Try it in 30 seconds
+
+```sh
+git clone --recursive <this-repo> && cd jetalloc
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./build/jet_tour        # a self-narrating tour of every guarantee
+ctest --test-dir build  # runs the proofs, incl. the programs that must NOT compile
+```
+
+`examples/tour.cpp` is the whole library on one screen — and its last three
+lines are the bugs that don't compile. Uncomment one and watch the type system
+reject it.
 
 ## API tour
 
@@ -155,11 +218,12 @@ through the identical typed interface; Mops/s, higher = better):
 
 | Workload | jetalloc | system malloc | speedup |
 |---|---:|---:|---:|
-| small-fixed (32 B) | **114** | 15 | **7.5×** |
-| mixed-size (8 B–4 KiB) | **20** | 8 | **2.5×** |
+| small-fixed (32 B) | **65–114** | ~15 | **4–7×** |
+| mixed-size (8 B–4 KiB) | **17–20** | ~8 | **~2.4×** |
 
-(Windows / UCRT, single core. Absolute numbers vary by machine; the ratio is the
-point — and it holds because the wins above are structural, not micro-tuning.)
+(Windows / UCRT, single core, `-O2`. Absolute Mops/s vary run-to-run and by
+machine — reproduce them yourself with `./build/jet_bench`. The *ratio* is the
+point, and it holds because the wins above are structural, not micro-tuning.)
 
 ## Thread safety
 
