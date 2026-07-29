@@ -177,6 +177,30 @@ disable the runtime borrow/contract checks in a hardened release build, compile
 with `-DJET_NO_CONTRACTS` (you keep every *compile-time* guarantee; you lose
 only the dynamic aliasing/dangling traps).
 
+### Make the whole program run on jetalloc
+
+jetalloc is a full drop-in allocator. Define `JET_GLOBAL_NEW` in **one**
+translation unit and every `new`/`delete` in the process — throwing, nothrow,
+sized, `new[]`, and over-aligned (`align_val_t`) — routes through jetalloc. No
+call sites change; `std::vector`, `std::string`, `std::make_shared`, and every
+other container come along for free.
+
+```cpp
+#define JET_GLOBAL_NEW      // one TU, before the include (or -DJET_GLOBAL_NEW)
+#include <jetalloc.hpp>
+// ...every new/delete in the whole program is now jetalloc. Nothing else changes.
+```
+
+Prefer the C API? It's all here, size-free on the free path:
+
+```cpp
+void* p = jet::malloc(64);
+p = jet::realloc(p, 4096);         // grows across size classes, preserves data
+void* z = jet::calloc(256, 4);     // zeroed
+void* a = jet::aligned_alloc(128, 512);
+jet::free(p); jet::free(z); jet::free(a);   // pointer only — no size to pass
+```
+
 ## Cross-platform, native speed everywhere
 
 jetalloc talks to the OS through **one virtual-memory layer**, and every
@@ -269,7 +293,8 @@ jet::trim();                  // return this thread's cached empty pages to the 
   UndefinedBehaviorSanitizer and ThreadSanitizer on every push.
 - **CI matrix**: Linux (GCC), macOS (Clang), Windows (MSVC), Debug + Release.
 - **Guarantees are tested**: `test/neg/` contains programs that *must fail to
-  compile*, and CTest asserts the compiler rejects each.
+  compile*, and CTest asserts the compiler rejects each. The global-allocator
+  interposition and C API are covered by `test/jet_test_global.cpp`.
 - **Semantic versioning** via `JETALLOC_VERSION_*` macros.
 
 ## Concurrency where thread bugs don't compile (`jetalloc_sync.hpp`)

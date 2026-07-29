@@ -61,6 +61,14 @@ if(JET_IS_TOPLEVEL)
     target_link_options(jet_test_sync PRIVATE ${_jet_san_flags})
     add_test(NAME jet_test_sync COMMAND jet_test_sync)
 
+    # Global-allocator interposition (JET_GLOBAL_NEW) + C-style malloc/free/
+    # realloc/calloc/aligned_alloc surface. Proves jetalloc is a full drop-in.
+    add_executable(jet_test_global test/jet_test_global.cpp)
+    target_link_libraries(jet_test_global PRIVATE jetalloc)
+    target_compile_options(jet_test_global PRIVATE $<$<CONFIG:Release>:-O2> ${_jet_san_flags})
+    target_link_options(jet_test_global PRIVATE ${_jet_san_flags})
+    add_test(NAME jet_test_global COMMAND jet_test_global)
+
     # Negative compile tests: each of these MUST fail to compile. We invoke the
     # compiler at build time and assert failure — proof that misuse is rejected.
     # Memory-safety negatives + concurrency-safety negatives.

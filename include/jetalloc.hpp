@@ -533,6 +533,21 @@ JET_ALWAYS_INLINE void raw_deallocate(void* p, std::size_t bytes, std::size_t al
     pg->owner->partial[pg->cls] = pg;
 }
 
+// Deallocate a block given ONLY its pointer — no size, no align. This is what
+// `operator delete` and a C-style `free` receive. We recover everything from
+// the block itself: a large allocation carries our magic tag in the word just
+// below the user pointer; anything else is a slab block whose owning 64 KiB
+// page (and thus its size class) is found by masking the address.
+JET_ALWAYS_INLINE void free_unsized(void* p) noexcept {
+    if (JET_UNLIKELY(!p)) return;
+    auto* h = reinterpret_cast<large_hdr*>(p) - 1;
+    if (JET_UNLIKELY(h->magic == kLargeMagic)) {
+        os_unmap(h->os_base, h->map_bytes, h->align < kPageSize ? kPageSize : h->align);
+        return;
+    }
+    raw_deallocate(p, 1, alignof(std::max_align_t));  // slab path: size unused
+}
+
 // Typed raw helpers with an overflow-checked element count.
 template <storable T>
 [[nodiscard]] inline T* typed_alloc(std::size_t count, bool& overflow) noexcept {
@@ -961,6 +976,101 @@ inline void trim() noexcept {
     h->pool_n = 0;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  11.  C-style surface + optional global new/delete interposition.
+//
+//  jetalloc is a full drop-in allocator. `jet::malloc`/`free`/`realloc`/
+//  `calloc` give you the raw C API, and defining JET_GLOBAL_NEW before the
+//  include routes EVERY `new`/`delete` in the program through jetalloc — the
+//  whole process is transparently on jetalloc, no code changes at the call
+//  sites. Both are size-free on the delete path (recovered from the block).
+// ════════════════════════════════════════════════════════════════════════
+
+// Raw C-style allocation. `jet::malloc` returns max_align_t-aligned storage;
+// `jet::free` takes the pointer alone; `jet::realloc` preserves min(old,new).
+[[nodiscard]] inline void* malloc(std::size_t n) noexcept {
+    return detail::raw_allocate(n ? n : 1, alignof(std::max_align_t));
+}
+inline void free(void* p) noexcept { detail::free_unsized(p); }
+
+[[nodiscard]] inline void* calloc(std::size_t count, std::size_t size) noexcept {
+    if (count && size > std::numeric_limits<std::size_t>::max() / count) return nullptr;
+    const std::size_t total = count * size;
+    void* p = detail::raw_allocate(total ? total : 1, alignof(std::max_align_t));
+    if (p) std::memset(p, 0, total);
+    return p;
+}
+
+[[nodiscard]] inline void* realloc(void* p, std::size_t n) noexcept {
+    if (!p) return jet::malloc(n);
+    if (n == 0) { detail::free_unsized(p); return nullptr; }
+    const std::size_t old = usable_size(p);
+    if (n <= old) return p;                       // shrink / fits: keep in place
+    void* np = jet::malloc(n);
+    if (!np) return nullptr;
+    std::memcpy(np, p, old < n ? old : n);
+    detail::free_unsized(p);
+    return np;
+}
+
+// Aligned C-style allocation (C11 aligned_alloc / posix_memalign semantics).
+[[nodiscard]] inline void* aligned_alloc(std::size_t align, std::size_t n) noexcept {
+    return detail::raw_allocate(n ? n : 1, align < alignof(std::max_align_t)
+                                               ? alignof(std::max_align_t) : align);
+}
+
 }  // namespace jet
+
+// ── Optional: make jetalloc THE global allocator for the whole program. ──────
+// Define JET_GLOBAL_NEW in exactly ONE translation unit before including this
+// header (or pass -DJET_GLOBAL_NEW). Every new/delete — throwing, nothrow,
+// sized, and aligned — then goes through jetalloc. Nothing else changes.
+#if defined(JET_GLOBAL_NEW)
+#include <new>
+
+[[nodiscard]] void* operator new(std::size_t n) {
+    void* p = ::jet::detail::raw_allocate(n ? n : 1, alignof(std::max_align_t));
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+[[nodiscard]] void* operator new[](std::size_t n) {
+    void* p = ::jet::detail::raw_allocate(n ? n : 1, alignof(std::max_align_t));
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+[[nodiscard]] void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
+    return ::jet::detail::raw_allocate(n ? n : 1, alignof(std::max_align_t));
+}
+[[nodiscard]] void* operator new[](std::size_t n, const std::nothrow_t&) noexcept {
+    return ::jet::detail::raw_allocate(n ? n : 1, alignof(std::max_align_t));
+}
+[[nodiscard]] void* operator new(std::size_t n, std::align_val_t a) {
+    void* p = ::jet::detail::raw_allocate(n ? n : 1, static_cast<std::size_t>(a));
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+[[nodiscard]] void* operator new[](std::size_t n, std::align_val_t a) {
+    void* p = ::jet::detail::raw_allocate(n ? n : 1, static_cast<std::size_t>(a));
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+[[nodiscard]] void* operator new(std::size_t n, std::align_val_t a, const std::nothrow_t&) noexcept {
+    return ::jet::detail::raw_allocate(n ? n : 1, static_cast<std::size_t>(a));
+}
+[[nodiscard]] void* operator new[](std::size_t n, std::align_val_t a, const std::nothrow_t&) noexcept {
+    return ::jet::detail::raw_allocate(n ? n : 1, static_cast<std::size_t>(a));
+}
+
+void operator delete(void* p) noexcept                        { ::jet::detail::free_unsized(p); }
+void operator delete[](void* p) noexcept                      { ::jet::detail::free_unsized(p); }
+void operator delete(void* p, std::size_t) noexcept           { ::jet::detail::free_unsized(p); }
+void operator delete[](void* p, std::size_t) noexcept         { ::jet::detail::free_unsized(p); }
+void operator delete(void* p, std::align_val_t) noexcept      { ::jet::detail::free_unsized(p); }
+void operator delete[](void* p, std::align_val_t) noexcept    { ::jet::detail::free_unsized(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept   { ::jet::detail::free_unsized(p); }
+void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { ::jet::detail::free_unsized(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept   { ::jet::detail::free_unsized(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { ::jet::detail::free_unsized(p); }
+#endif  // JET_GLOBAL_NEW
 
 #endif  // JETALLOC_HPP
