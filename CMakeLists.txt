@@ -69,6 +69,15 @@ if(JET_IS_TOPLEVEL)
     target_link_options(jet_test_global PRIVATE ${_jet_san_flags})
     add_test(NAME jet_test_global COMMAND jet_test_global)
 
+    # Hardened tier: prove JET_HARDENED turns heap corruption (double free,
+    # interior/wild free, freelist-link tampering) into a defined abort. This
+    # binary self-drives: it re-spawns itself per corruption case and asserts
+    # each child aborted with the guard diagnostic, so it is one clean pass.
+    add_executable(jet_test_hardened test/jet_test_hardened.cpp)
+    target_link_libraries(jet_test_hardened PRIVATE jetalloc)
+    target_compile_options(jet_test_hardened PRIVATE $<$<CONFIG:Release>:-O2>)
+    add_test(NAME jet_test_hardened COMMAND jet_test_hardened)
+
     # Negative compile tests: each of these MUST fail to compile. We invoke the
     # compiler at build time and assert failure — proof that misuse is rejected.
     # Memory-safety negatives + concurrency-safety negatives.

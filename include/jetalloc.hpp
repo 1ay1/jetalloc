@@ -36,6 +36,7 @@
 
 #include <atomic>
 #include <bit>
+#include <cerrno>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -98,6 +99,27 @@ namespace jet {
 #else
 #  define JET_ASSERT(cond, msg) (static_cast<bool>(cond) ? (void)0 : ::jet::panic(msg))
 #endif
+
+// ── Hardening tier ───────────────────────────────────────────────────
+// Define JET_HARDENED to trade a little speed for anti-corruption defenses on
+// the allocator's raw path: freelist-pointer encoding (defeats the classic
+// "overwrite a freed block's next-pointer" exploit), double-free / wild-free
+// detection, and block-boundary validation. OFF by default — every check below
+// is gated by `kHardened` so a non-hardened build emits byte-identical hot-path
+// code. JET_NO_CONTRACTS does NOT disable hardening (they are orthogonal: one
+// governs the type-layer borrow checker, the other the raw heap's integrity).
+#if defined(JET_HARDENED)
+inline constexpr bool kHardened = true;
+#else
+inline constexpr bool kHardened = false;
+#endif
+
+// A heap-integrity violation is always fatal and loud, even under
+// JET_NO_CONTRACTS — a corrupted heap must never be allowed to proceed.
+[[noreturn]] inline void heap_panic(const char* what) noexcept {
+    std::fprintf(stderr, "jetalloc: HEAP CORRUPTION detected: %s\n", what);
+    std::abort();
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 //  1.  Error domain — closed, exhaustively handleable. OOM is a value.
@@ -319,7 +341,7 @@ struct heap;   // fwd
 // parked there so the owner can reconcile `used` exactly.
 struct alignas(64) page {
     heap*         owner;       // owning thread's heap (fast-path check)
-    void*         free_list;   // owner-private LIFO free list
+    void*         free_list;   // owner-private LIFO free list (encoded if hardened)
     std::byte*    data;        // first block address (precomputed)
     std::atomic<void*>       remote_free{nullptr};   // MPSC stack of foreign frees
     std::atomic<std::uint32_t> remote_count{0};      // # parked in remote_free
@@ -329,7 +351,49 @@ struct alignas(64) page {
     std::uint32_t bump;        // next never-yet-served block index
     page*         next;        // intrusive partial-list link
     std::uint16_t cls;         // size class
+    std::uintptr_t cookie;     // per-page freelist-encoding key (hardened builds)
+
+    // True iff `p` is the start of a real block in this page's data region:
+    // inside [data, data+capacity*block_size) and exactly block-aligned. Used
+    // by the hardened path to reject wild / interior / double frees.
+    [[nodiscard]] JET_ALWAYS_INLINE bool contains_block(const void* p) const noexcept {
+        auto up = reinterpret_cast<std::uintptr_t>(p);
+        auto lo = reinterpret_cast<std::uintptr_t>(data);
+        auto hi = lo + static_cast<std::uintptr_t>(capacity) * block_size;
+        if (up < lo || up >= hi) return false;
+        return (up - lo) % block_size == 0;
+    }
 };
+
+// ── Freelist-pointer hardening ────────────────────────────────────────
+// In a hardened build the `next` link a freed block stores is XOR-encoded with
+// a per-page random cookie, so a heap overflow that overwrites the link cannot
+// steer the next allocation to an attacker-chosen address (it would have to
+// know the cookie). In a normal build these are the identity — zero cost.
+[[nodiscard]] JET_ALWAYS_INLINE void* enc_next(const page* pg, void* p) noexcept {
+    if constexpr (kHardened)
+        return reinterpret_cast<void*>(reinterpret_cast<std::uintptr_t>(p) ^ pg->cookie);
+    else
+        return p;
+}
+[[nodiscard]] JET_ALWAYS_INLINE void* dec_next(const page* pg, void* p) noexcept {
+    return enc_next(pg, p);   // XOR is its own inverse
+}
+
+// A cheap non-cryptographic per-page key: mix the page address with a
+// process-lifetime seed. Enough to make the cookie unpredictable to an
+// out-of-process attacker and to differ per page.
+[[nodiscard]] inline std::uintptr_t page_cookie_for(const void* pg) noexcept {
+    static const std::uintptr_t seed = [] {
+        std::uintptr_t s = reinterpret_cast<std::uintptr_t>(&seed);
+        s ^= static_cast<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(
+                 std::addressof(errno)) * 0x9E3779B97F4A7C15ull);
+        return s | 1u;
+    }();
+    std::uintptr_t x = reinterpret_cast<std::uintptr_t>(pg) ^ seed;
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33;   // fmix64
+    return x | 1u;   // never 0, so encoding a real pointer never yields it back raw
+}
 
 // Per-thread heap. `partial[cls]` head is ALWAYS an allocatable page (full
 // pages are unlinked on the spot), so alloc_small never scans a list. Empty
@@ -401,6 +465,7 @@ struct heap {
         pg->cls = static_cast<std::uint16_t>(cls);
         pg->capacity = static_cast<std::uint32_t>((kPageSize - hdr) / bs);
         pg->bump = 0;
+        pg->cookie = kHardened ? page_cookie_for(pg) : 0;
         pg->next = partial[cls];
         partial[cls] = pg;
         return pg;
@@ -414,8 +479,12 @@ struct heap {
         void* head = pg->remote_free.exchange(nullptr, std::memory_order_acquire);
         std::uint32_t n = pg->remote_count.exchange(0, std::memory_order_relaxed);
         while (head) {
-            void* nxt = *static_cast<void**>(head);
-            *static_cast<void**>(head) = pg->free_list;
+            void* nxt = *static_cast<void**>(head);   // remote stack: raw links
+            if constexpr (kHardened) {
+                if (!pg->contains_block(head))
+                    heap_panic("remote-free list corrupted (bad block pointer)");
+            }
+            *static_cast<void**>(head) = enc_next(pg, pg->free_list);
             pg->free_list = head;
             head = nxt;
         }
@@ -436,7 +505,15 @@ struct heap {
             blk = pg->free_list;
         }
         if (JET_LIKELY(blk != nullptr)) {
-            pg->free_list = *static_cast<void**>(blk);
+            void* nxt = dec_next(pg, *static_cast<void**>(blk));
+            if constexpr (kHardened) {
+                // The decoded next must be null or a properly-aligned block
+                // inside this page's data region — otherwise the link was
+                // corrupted (overflow / use-after-free write).
+                if (nxt && !pg->contains_block(nxt))
+                    heap_panic("freelist link corrupted (bad next pointer)");
+            }
+            pg->free_list = nxt;
         } else {
             blk = pg->data + std::size_t(pg->bump++) * pg->block_size;
         }
@@ -490,6 +567,14 @@ JET_ALWAYS_INLINE void raw_deallocate(void* p, std::size_t bytes, std::size_t al
     }
     page* pg = page_of(p);
 
+    if constexpr (kHardened) {
+        // Wild / interior free: the pointer must be a real block start in a
+        // page this process actually owns for a small class.
+        if (pg->owner == nullptr || pg->block_size == 0 ||
+            pg->cls >= kNumClasses || !pg->contains_block(p))
+            heap_panic("invalid free (not a jetalloc block, or interior pointer)");
+    }
+
     // Cross-thread free: the block belongs to another thread's heap. Do NOT
     // touch any owner-private state (that would be a data race). Push it onto
     // the page's lock-free MPSC remote-free stack; the owner reclaims it later.
@@ -502,9 +587,26 @@ JET_ALWAYS_INLINE void raw_deallocate(void* p, std::size_t bytes, std::size_t al
         return;
     }
 
+    if constexpr (kHardened) {
+        // Double-free detection. A full free-list walk would be O(n) per free
+        // (quadratic as a page drains), so we bound the scan to a small window
+        // near the head — this catches the realistic case (an immediate or
+        // near-immediate re-free of the same block) in O(1). The freelist
+        // encoding below independently defeats the *exploitation* of any
+        // double-free that slips past the window, so this is defense-in-depth,
+        // not the sole barrier.
+        constexpr int kScan = 16;
+        void* c = pg->free_list;
+        for (int i = 0; i < kScan && c; ++i, c = dec_next(pg, *static_cast<void**>(c))) {
+            if (c == p) heap_panic("double free (block already on the free list)");
+        }
+        if (JET_UNLIKELY(pg->used == 0))
+            heap_panic("double free (page has no live blocks)");
+    }
+
     // Same-thread free: owner-private, no atomics.
     const bool was_full = (pg->used == pg->capacity);   // unlinked from partial?
-    *static_cast<void**>(p) = pg->free_list;
+    *static_cast<void**>(p) = enc_next(pg, pg->free_list);
     pg->free_list = p;
     --pg->used;
     if (JET_LIKELY(!was_full)) {

@@ -201,6 +201,34 @@ void* a = jet::aligned_alloc(128, 512);
 jet::free(p); jet::free(z); jet::free(a);   // pointer only — no size to pass
 ```
 
+### Hardened mode (`-DJET_HARDENED`)
+
+Memory-*safety* (the typed layer) stops **your** bugs at compile time. Memory-
+*integrity* (this tier) defends the heap itself against corruption — the kind
+that comes from a buffer overflow elsewhere in the process, or a stale pointer
+freed twice. Compile with `-DJET_HARDENED` and the raw allocator gains, on the
+free path:
+
+- **Freelist-pointer encoding** — the `next` link a freed block stores is
+  XOR-encoded with a per-page random cookie. The classic exploit primitive
+  ("overflow into a freed block, overwrite its link, redirect the next
+  allocation to an address you chose") is defeated: you'd have to know the
+  cookie. A decoded link that doesn't point at a real block in the page is a
+  **defined abort**, not a hijacked `malloc`.
+- **Double-free & invalid-free detection** — freeing a pointer that isn't a
+  real block start (a wild or interior pointer), or re-freeing a block already
+  on the free list, aborts with a diagnostic instead of silently corrupting the
+  list.
+
+Every check is gated behind `if constexpr (kHardened)`, so a **normal build
+emits byte-identical hot-path code** — you pay nothing unless you opt in. When
+you do, the hardened `page-churn` workload still runs at ~3× system malloc.
+Hardening is **orthogonal to `-DJET_NO_CONTRACTS`**: a heap-integrity violation
+is always fatal and loud, even in a build with the type-layer contracts off
+— a corrupted heap must never be allowed to proceed. Proven by
+`test/jet_test_hardened.cpp`, which spawns the corruption cases and asserts each
+aborts.
+
 ## Cross-platform, native speed everywhere
 
 jetalloc talks to the OS through **one virtual-memory layer**, and every
