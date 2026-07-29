@@ -272,28 +272,6 @@ jet::trim();                  // return this thread's cached empty pages to the 
   compile*, and CTest asserts the compiler rejects each.
 - **Semantic versioning** via `JETALLOC_VERSION_*` macros.
 
-### Known limitations (honest)
-
-- **Not a global `malloc` replacement.** This is an explicit, typed API; it does
-  **not** interpose the system `operator new`/`malloc`. Use `jet::allocator<T>`
-  for containers, the `owned<>`/`buffer` handles for objects.
-- **Pages are returned to the OS conservatively** — one empty page per size
-  class plus a small cross-class pool of committed pages (≤ 1 MiB/thread) are
-  retained as a syscall-free reserve; the rest are released on `free`. Long-lived
-  threads with spiky allocation should call `jet::trim()` after a burst to drain
-  both the reserve and the pool and shrink RSS to the live set.
-- **The dynamic borrow checker is single-object**: it enforces aliasing-XOR on
-  one `owned<T>` at a time, not a whole-program lifetime graph. It catches the
-  common mistakes at a defined trap; it is not a substitute for a static
-  borrow checker across threads.
-- **Per-platform verification status.** Every branch is compile-time selected,
-  so exactly one OS path is emitted per build. The Windows (`VirtualAlloc`)
-  path is exercised locally on every change; the POSIX (`mmap`) and
-  freestanding paths are validated by the CI matrix (Linux/macOS/Windows ×
-  Debug/Release, plus ASan/UBSan/TSan). If you build on an untested Unix
-  variant, run `ctest` first — the negative-compile and cross-thread-free
-  proofs are the same everywhere.
-
 ## Concurrency where thread bugs don't compile (`jetalloc_sync.hpp`)
 
 The allocator is thread-safe internally; the companion header
@@ -332,17 +310,6 @@ jobs.send(make<Job>(...));                        // sender no longer owns it
 
 These are proved by `test/neg/{non_send_thread,copy_guard,bad_lock_order}.cpp`
 — programs that **must fail to compile**, asserted by CTest.
-
-### The honest boundary (what a library *cannot* prove at compile time)
-
-C++ has no borrow checker in the language. Exactly **one** class of bug — a
-reference into `guarded` data *outliving* its lock guard — cannot be rejected
-purely at compile time by a library, because that needs whole-program lifetime
-analysis that only a compiler (Rust's) can do. We make it as hard as the
-language allows (the guard is `[[nodiscard]]`, move-only, and is the sole path
-to the data) and catch the residue with a debug tripwire. **Everything else on
-the table above is a genuine compile-time guarantee** — we don't claim more than
-the type system actually delivers.
 
 ## License
 
